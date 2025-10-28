@@ -20,15 +20,19 @@ env/
 
 # --- 数据和模型文件 (核心部分！) ---
 # 忽略所有数据目录
-Potsdam_processed/
-teacher_outputs/
-splits/
+../data/Potsdam_processed/
+../data/teacher_outputs/
+../data/splits/
 
 # 忽略所有原始数据集 (如果你会放在这里的话)
 Potsdam/
 
 # 忽略所有训练输出
 outputs/
+
+# 忽略所有数据资产
+data/
+pretrained_weights/
 
 # 忽略所有模型权重文件
 *.pth

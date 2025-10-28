@@ -4,13 +4,15 @@
 import os
 from pathlib import Path
 
+from distributed.protocol import torch
+
 
 class Config:
     """训练和评估配置"""
 
     # ==================== 路径配置 ====================
     # 项目根目录（修改为你的实际路径）
-    PROJECT_ROOT = Path("D:/Paper/project")
+    PROJECT_ROOT = Path(__file__).parent.resolve()
 
     # 数据路径
     DATA_ROOT = PROJECT_ROOT / "Potsdam_processed"
@@ -18,11 +20,10 @@ class Config:
     LABEL_DIR = DATA_ROOT / "labels"
 
     # 教师网络输出路径
-    TEACHER_ROOT = PROJECT_ROOT / "teacher_outputs"
-    FEATURE_30_DIR = TEACHER_ROOT / "features_30"
-    FEATURE_31_DIR = TEACHER_ROOT / "features_31"
-    LOGITS_DIR = TEACHER_ROOT / "logits"
-    MASKS_DIR = TEACHER_ROOT / "masks"
+    TEACHER_ROOT = PROJECT_ROOT / "data/teacher_outputs"
+    FEATURE_BLOCK30_DIR = TEACHER_ROOT / "features_block30"
+    FEATURE_ENCODER_DIR = TEACHER_ROOT / "features_encoder"
+
 
     # 输出路径
     OUTPUT_ROOT = PROJECT_ROOT / "outputs"
@@ -56,12 +57,12 @@ class Config:
 
     # 类别名称
     CLASS_NAMES = [
-        'Impervious surfaces',
-        'Building',
-        'Low vegetation',
-        'Tree',
-        'Car',
-        'Background'
+        'Impervious surfaces',  # Class 0
+        'Building',  # Class 1
+        'Low vegetation',  # Class 2
+        'Tree',  # Class 3
+        'Car',  # Class 4
+        'Clutter/Background'  # Class 5
     ]
 
     # 类别颜色（用于可视化）
@@ -88,6 +89,7 @@ class Config:
     BATCH_SIZE = 8  # 4060 8G显存可以用8
     NUM_EPOCHS = 100  # 可以调整到150-200
     NUM_WORKERS = 4  # 数据加载线程数
+    USE_AMP = True
 
     # 优化器参数
     OPTIMIZER = "adamw"
@@ -102,14 +104,13 @@ class Config:
     WARMUP_LR = 1e-6
 
     # 损失函数权重
-    LOSS_CE_WEIGHT = 1.0  # 交叉熵损失
-    LOSS_KD_WEIGHT = 0.5  # KD蒸馏损失
-    LOSS_FEAT_WEIGHT = 0.3  # 特征蒸馏损失
-    LOSS_BOUNDARY_WEIGHT = 0.2  # 边缘损失（你的创新）
+    # 阶段一：二分类分割蒸馏
+    LOSS_SEG_WEIGHT = 1.0  # 分割损失 (例如 Dice/BCE Loss)
+    LOSS_FEAT_B30_WEIGHT = 0.5  # Block 30 特征蒸馏损失
+    LOSS_FEAT_ENC_WEIGHT = 0.5  # Encoder 特征蒸馏损失
 
-    # KD蒸馏温度
-    KD_TEMPERATURE = 4.0
-
+    # 训练配置新增
+    USE_AMP = True  # 使用 Automatic Mixed Precision 加速并节省 VRAM
     # ==================== 数据增强配置 ====================
     # 训练时增强（只在训练集使用）
     USE_AUGMENTATION = True
@@ -150,17 +151,17 @@ class Config:
     BASELINE_MODELS = {
         'SAM_ViT_H': {
             'type': 'sam',
-            'checkpoint': str(PROJECT_ROOT / "数据预处理与教师网络输出" / "sam_vit_h_4b8939.pth"),
+            'checkpoint': str(PROJECT_ROOT / "pretrained_weights/sam_vit_h_4b8939.pth"), # 假设路径
             'use_masks': True  # 直接用已提取的masks
         },
         'MobileSAM': {
             'type': 'mobile_sam',
-            'checkpoint': None,  # 需要下载
+            'checkpoint': str(PROJECT_ROOT / "checkpoints/mobile_sam.pt"),  # 需下载
             'repo': 'https://github.com/ChaoningZhang/MobileSAM'
         },
         'FastSAM': {
             'type': 'fast_sam',
-            'checkpoint': None,  # 需要下载
+            'checkpoint': str(PROJECT_ROOT / "checkpoints/FastSAM.pt"),  # 需下载
             'repo': 'https://github.com/CASIA-IVA-Lab/FastSAM'
         },
         'DeepLabV3+': {
@@ -176,12 +177,13 @@ class Config:
     }
 
     # ==================== 设备配置 ====================
-    DEVICE = "cuda"  # 或 "cpu"
+    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
     SEED = 42  # 随机种子
 
     # ==================== 调试配置 ====================
     DEBUG = False
     DEBUG_SAMPLES = 100  # debug模式下只用100个样本
+    USE_TENSORBOARD = True
 
     @classmethod
     def display(cls):
@@ -204,10 +206,6 @@ cfg = Config()
 
 if __name__ == '__main__':
     # 测试配置
+    cfg.setup_env()  # 在主脚本开头调用
     cfg.display()
 
-    # 检查路径是否存在
-    print("\n检查路径...")
-    print(f"图像目录: {cfg.IMAGE_DIR.exists()}")
-    print(f"标签目录: {cfg.LABEL_DIR.exists()}")
-    print(f"教师特征: {cfg.FEATURE_31_DIR.exists()}")
