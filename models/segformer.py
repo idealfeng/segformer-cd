@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import SegformerForSemanticSegmentation, SegformerModel, SegformerConfig
-from config import cfg
+from config import cfg # ✅ 正确的导入方式！
+import torch.utils.checkpoint as checkpoint
 from transformers.models.segformer.modeling_segformer import SegformerMLP
 
 # ✅ 修复1: 明确定义模型输出通道数，与任务解耦
@@ -97,7 +98,9 @@ class SegFormerDistillation(nn.Module):
             ignore_mismatched_sizes=True
         )
         self.backbone = full_model.segformer
-
+        # if cfg.USE_GRADIENT_CHECKPOINTING and self.training:
+        #     self.backbone.gradient_checkpointing_enable()
+        #     print("✓ 官方梯度检查点 (Gradient Checkpointing) 已启用")
         # 从加载的模型配置中动态获取维度，更健壮
         student_dims = self.backbone.config.hidden_sizes
         c1, c2, c3, c4 = student_dims
@@ -147,11 +150,21 @@ class SegFormerDistillation(nn.Module):
         """
         B, C, H, W = x.shape
 
-        # 前向传播backbone
-        outputs = self.backbone(
-            pixel_values=x,
-            output_hidden_states=True
-        )
+        # ✅ 用checkpoint包装backbone（节省显存）
+        def backbone_forward(pixel_values):
+            return self.backbone(
+                pixel_values=pixel_values,
+                output_hidden_states=True
+            )
+
+        if self.training and cfg.USE_GRADIENT_CHECKPOINTING:
+            outputs = checkpoint.checkpoint(
+                backbone_forward,
+                x,
+                use_reentrant=False
+            )
+        else:
+            outputs = backbone_forward(x)
 
         hidden_states = outputs.hidden_states
 
@@ -212,7 +225,7 @@ def build_segformer_distillation(
     """
     # 从config读取教师特征维度
     if teacher_feat_b30_dim is None:
-        teacher_feat_b30_dim = cfg.TEACHER_FEAT_30_DIM # 假设config里是这个名字
+        teacher_feat_b30_dim = cfg.TEACHER_FEAT_BLOCK30_DIM # 假设config里是这个名字
     if teacher_feat_enc_dim is None:
         teacher_feat_enc_dim = cfg.TEACHER_FEAT_ENCODER_DIM # 假设config里是这个名字
 

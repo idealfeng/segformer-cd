@@ -8,6 +8,9 @@
     python train.py --resume best.pth  # 恢复训练
 """
 import os
+os.environ['ALBUMENTATIONS_CHECK_VERSION'] = 'False'
+
+# --- 你原来的 import 语句 ---
 import argparse
 from pathlib import Path
 from tqdm import tqdm
@@ -17,13 +20,25 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 import json
 from datetime import datetime
-
+# ✅ 新增: 导入 random 和 numpy
+import random
+import numpy as np
 from config import cfg
 from dataset import build_dataloader
 from models.segformer import build_segformer_distillation
 from losses import DistillationLoss
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
-
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        # 确保cudnn的确定性，可能会牺牲一点点性能
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 class Trainer:
     """训练器"""
 
@@ -42,19 +57,24 @@ class Trainer:
 
         # 数据加载器
         actual_batch_size = cfg.BATCH_SIZE // cfg.GRADIENT_ACCUMULATION_STEPS
+        if actual_batch_size == 0:
+            actual_batch_size = 1 # 至少为1
+
         self.train_loader = build_dataloader('train', batch_size=actual_batch_size, shuffle=True)
-        self.val_loader = build_dataloader('val', batch_size=1, shuffle=False)
+        self.val_loader = build_dataloader('val', batch_size=1, shuffle=False) # 验证集通常用batch=1
 
         print(f"训练集: {len(self.train_loader.dataset)} 张")
         print(f"验证集: {len(self.val_loader.dataset)} 张")
-        print(f"Batch Size: {cfg.BATCH_SIZE}")
+        # ✅ Point 2 (优化): 打印信息更清晰
+        print(f"全局Batch Size: {cfg.BATCH_SIZE}")
+        print(f"物理Batch Size (per step): {actual_batch_size}")
+        print(f"梯度累积步数: {cfg.GRADIENT_ACCUMULATION_STEPS}")
         print(f"设备: {self.device}")
-        print(f"实际Batch Size: {actual_batch_size} (累积{cfg.GRADIENT_ACCUMULATION_STEPS}步 = 等效{cfg.BATCH_SIZE})")
         # 优化器和调度器
         self.optimizer = self.build_optimizer()
         self.scheduler = self.build_scheduler()
 
-        # 损失函数
+        # 损失函数（BCE+Dice + 两路 MSE 蒸馏）
         self.criterion = DistillationLoss()
 
         # AMP
@@ -102,20 +122,23 @@ class Trainer:
 
     def build_scheduler(self):
         """构建学习率调度器"""
-        total_steps = len(self.train_loader) * cfg.NUM_EPOCHS
+        optimizer_steps_per_epoch = len(self.train_loader) // cfg.GRADIENT_ACCUMULATION_STEPS
+        total_steps = optimizer_steps_per_epoch * cfg.NUM_EPOCHS
 
         if cfg.LR_SCHEDULER == 'polynomial':
             from torch.optim.lr_scheduler import LambdaLR
 
+            warmup_steps = cfg.WARMUP_EPOCHS * optimizer_steps_per_epoch
+
             def poly_lr_lambda(step):
-                if step < cfg.WARMUP_EPOCHS * len(self.train_loader):
+                if step < warmup_steps:
                     # Warmup阶段
-                    return step / (cfg.WARMUP_EPOCHS * len(self.train_loader))
+                    return float(step) / float(max(1, warmup_steps))
                 else:
                     # Polynomial decay
-                    progress = (step - cfg.WARMUP_EPOCHS * len(self.train_loader)) / (
-                                total_steps - cfg.WARMUP_EPOCHS * len(self.train_loader))
-                    return (1 - progress) ** cfg.LR_POWER
+                    decay_steps = total_steps - warmup_steps
+                    progress = float(step - warmup_steps) / float(max(1, decay_steps))
+                    return (1.0 - progress) ** cfg.LR_POWER
 
             scheduler = LambdaLR(self.optimizer, lr_lambda=poly_lr_lambda)
 
@@ -138,7 +161,7 @@ class Trainer:
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{cfg.NUM_EPOCHS}")
 
-        self.optimizer.zero_grad()  # ✅ 移到循环外
+        self.optimizer.zero_grad(set_to_none=True)
         for batch_idx, batch in enumerate(pbar):
             # 准备数据
             images = batch['image'].to(self.device)
@@ -149,6 +172,7 @@ class Trainer:
             }
 
             if cfg.USE_AMP:
+                # 可以自动地、在你认为安全的地方，把计算从Float32切换到Float16去跑
                 with autocast():
                     outputs = self.model(images)
                     loss, loss_dict = self.criterion(outputs, targets)
@@ -156,14 +180,14 @@ class Trainer:
                 # ✅ 缩放loss
                 loss = loss / cfg.GRADIENT_ACCUMULATION_STEPS
 
-                # 反向传播
+                # 反向传播,在反向传播之前，它把损失值乘以一个巨大的倍数（比如65536），防止精细的梯度在FP16下变成0。
                 self.scaler.scale(loss).backward()
 
                 # ✅ 每N步更新一次参数
                 if (batch_idx + 1) % cfg.GRADIENT_ACCUMULATION_STEPS == 0:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.zero_grad()
+                    self.scaler.step(self.optimizer)        # 在更新权重之前，它会先检查梯度是否正常，然后自动地把放大的梯度缩回原来的大小，再让优化器去更新模型。
+                    self.scaler.update()                        # 如果发现梯度还是太小，下次就放得更大一点。
+                    self.optimizer.zero_grad(set_to_none=True)
 
                     # 学习率调度（移到这里）
                     self.scheduler.step()
@@ -262,6 +286,8 @@ class Trainer:
 
         return avg_loss, iou
 
+
+    #  注意点：resume 后学习率会跟随 scheduler_state_dict 恢复到历史的位置
     def save_checkpoint(self, epoch, iou, is_best=False):
         """保存checkpoint"""
         checkpoint = {
@@ -285,6 +311,12 @@ class Trainer:
         torch.save(checkpoint, save_path)
         print(f"✓ 保存checkpoint: {save_path}")
 
+        max_keep = 5  # 你可以在config里定义这个值
+        checkpoints = sorted(cfg.CHECKPOINT_DIR.glob('epoch_*.pth'), key=os.path.getmtime)
+        if len(checkpoints) > max_keep:
+            for old_ckpt in checkpoints[:-max_keep]:
+                old_ckpt.unlink()
+                print(f"✓ 清理旧checkpoint: {old_ckpt.name}")
         # 保存最优
         if is_best:
             best_path = cfg.CHECKPOINT_DIR / 'best.pth'
@@ -308,6 +340,12 @@ class Trainer:
         print(f"✓ 恢复训练从epoch {self.start_epoch}")
         print(f"✓ 最优IoU: {self.best_iou:.4f}")
 
+    """
+    每个 epoch：train_epoch → 写 TensorBoard（Train/loss_epoch 以及各项 loss 平均）
+    validate（按 VAL_FREQ）→ 写 Val/loss 与 Val/IoU
+    比较 val_iou 是否刷新 best；保存 epoch ckpt / best ckpt；early stopping 计数
+    最后打印 best_iou
+    """
     def train(self):
         """主训练循环"""
         print("\n" + "=" * 60)
@@ -369,21 +407,38 @@ class Trainer:
 
 
 def main():
+    """
+    --epochs: 让你可以在命令行临时覆盖配置文件里的训练轮数，进行快速测试，极其方便！
+    --resume: 提供了断点续训功能，如果训练意外中断，你可以用这个参数，从上次保存的地方继续，而不是从头再来。
+    set_seed(cfg.SEED): 在一切开始之前，锁定随机数，确保了实验的可复现性。
+    配置备份: 自动将本次运行的所有配置参数，保存为一个config.json文件
+    """
     parser = argparse.ArgumentParser(description='训练SegFormer蒸馏模型')
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
     parser.add_argument('--resume', type=str, default=None, help='恢复训练的checkpoint路径')
     args = parser.parse_args()
 
+    set_seed(cfg.SEED)
+
     # 覆盖epochs配置
     if args.epochs is not None:
         cfg.NUM_EPOCHS = args.epochs
 
-    # 创建训练器
+    config_dict = {
+        k: (str(v) if isinstance(v, Path) else v)
+        for k, v in vars(cfg).items()
+        if not k.startswith('__') and not callable(v)
+    }
+
+    # 在创建Trainer之前确保日志目录存在
+    cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    with open(cfg.LOG_DIR / 'config.json', 'w') as f:
+        json.dump(config_dict, f, indent=4)
+    print(f"✓ 配置文件已保存到: {cfg.LOG_DIR / 'config.json'}")
+
     trainer = Trainer(args)
-
-    # 开始训练
     trainer.train()
-
 
 if __name__ == '__main__':
     main()

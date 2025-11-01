@@ -56,8 +56,12 @@ class Config:
     IMAGE_SIZE = 1024
 
     # 类别数（根据Potsdam调整）
-    NUM_CLASSES = 2  # 前景背景
+    NUM_CLASSES = 1  # 二分类单通道输出
+    NUM_CLASSES_SEMANTIC = 2  # 语义上是2类（背景/前景）
     NUM_CLASSES_DATA=6 # 原始数据集
+
+    # Ignore标签
+    IGNORE_LABEL = 255  # 用于标记无效区域
 
     # 类别名称
     CLASS_NAMES_DATA = [
@@ -95,18 +99,18 @@ class Config:
     STUDENT_PRETRAINED = True  # 使用ImageNet预训练
 
     # 教师网络特征维度
-    TEACHER_FEAT_30_DIM = 1280  # Block 30
+    TEACHER_FEAT_BLOCK30_DIM = 1280  # Block 30
     TEACHER_FEAT_ENCODER_DIM = 256  # Block 31
 
     # ==================== 训练配置 ====================
     # 基础训练参数
-    BATCH_SIZE = 8  # 4060 8G显存可以用8
+    BATCH_SIZE = 16 # 4060 8G显存可以用8
     NUM_EPOCHS = 100  # 可以调整到150-200
     NUM_WORKERS = 4  # 数据加载线程数
     USE_AMP = True
 
     # 可选：添加梯度累积（新增）
-    GRADIENT_ACCUMULATION_STEPS = 2  # 等效batch_size=8
+    GRADIENT_ACCUMULATION_STEPS = 4# 等效batch_size=4
 
     # 优化器参数
     OPTIMIZER = "adamw"
@@ -128,6 +132,7 @@ class Config:
 
     # 训练配置新增
     USE_AMP = True  # 使用 Automatic Mixed Precision 加速并节省 VRAM
+    USE_GRADIENT_CHECKPOINTING =False  # 默认我们先关掉它
     # ==================== 数据增强配置 ====================
     # 训练时增强（只在训练集使用）
     USE_AUGMENTATION = True

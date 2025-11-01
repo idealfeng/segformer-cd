@@ -8,8 +8,7 @@ import torch.nn as nn
 from tqdm import tqdm
 import numpy as np
 import torch.nn.functional as F
-
-from config import cfg
+from config import cfg # ✅ 正确的导入方式！
 from dataset import build_dataloader
 # 从 models 文件夹下的 segformer.py 文件中导入
 from models.segformer import build_segformer_distillation
