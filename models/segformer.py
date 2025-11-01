@@ -53,6 +53,7 @@ class FeatureAlignLayer(nn.Module):
         """
         x = self.conv(x)
         x = self.bn(x)
+        x = self.relu(x)
 
         # 空间对齐
         if self.scale_factor != 1:
@@ -107,26 +108,16 @@ class SegFormerDistillation(nn.Module):
 
         # ✅ 修改classifier为单通道输出
         self.decode_head.classifier = nn.Conv2d(
-            self.backbone.config.decoder_hidden_size,
-            OUT_CHANNELS,  # 1
+            self.decode_head.classifier.in_channels,
+            OUT_CHANNELS, # 输出1通道
             kernel_size=1
         )
         # 原来两路都写了 scale_factor=2
-        self.align_block30 = FeatureAlignLayer(in_channels=c3, out_channels=teacher_feat_b30_dim,
-                                               scale_factor=1)  # ← 改 1
-        self.align_encoder = FeatureAlignLayer(in_channels=c4, out_channels=teacher_feat_enc_dim,
-                                               scale_factor=2)  # ← 保持 2
-        dec_ch = self.backbone.config.decoder_hidden_size  # 一般是 256
-        self.stage_proj = nn.ModuleList([
-            nn.Sequential(nn.Conv2d(c1, dec_ch, kernel_size=1, bias=False), nn.BatchNorm2d(dec_ch),
-                          nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(c2, dec_ch, kernel_size=1, bias=False), nn.BatchNorm2d(dec_ch),
-                          nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(c3, dec_ch, kernel_size=1, bias=False), nn.BatchNorm2d(dec_ch),
-                          nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Conv2d(c4, dec_ch, kernel_size=1, bias=False), nn.BatchNorm2d(dec_ch),
-                          nn.ReLU(inplace=True)),
-        ])
+        student_dims = self.backbone.config.hidden_sizes
+        c3, c4 = student_dims[2], student_dims[3]
+
+        self.align_block30 = FeatureAlignLayer(in_channels=c3, out_channels=teacher_feat_b30_dim, scale_factor=1)
+        self.align_encoder = FeatureAlignLayer(in_channels=c4, out_channels=teacher_feat_enc_dim, scale_factor=2)
 
         print("✓ 模型加载完成, 特征对齐层和官方解码头创建完成")
 
@@ -175,31 +166,12 @@ class SegFormerDistillation(nn.Module):
         feat_stage3 = all_stage_features[2]
         feat_stage4 = all_stage_features[3]
 
-        target_size = all_stage_features[0].shape[2:]  # 以 stage1 尺度为基准
-        proj_feats = []
-        for i, feat in enumerate(all_stage_features):
-            feat_proj = self.stage_proj[i](feat)  # 先投成 256 通道
-            if feat_proj.shape[2:] != target_size:
-                feat_proj = F.interpolate(feat_proj, size=target_size, mode='bilinear', align_corners=False)
-            proj_feats.append(feat_proj)
+        # ✅ 【核心修正】: 正确地调用官方解码头
+        # 它期望输入一个包含4个stage特征的列表
+        logits = self.decode_head(all_stage_features)  # 输出已经是 (B, 1, H/4, W/4)
 
-        """
-        多尺度特征提取和融合
-        Stage0: 最清晰的细节速写本 (256x256)
-        Stage1: 稍微模糊一点的轮廓本 (128x128)
-        Stage2: 更模糊的结构本 (64x64)
-        Stage3: 最模糊的、只剩意境的印象画 (32x32)
-        torch.cat(proj_feats, dim=1)连接了从最浅层的、富含纹理的Stage0特征，到最深层的、富含语义的Stage3特征。
-        """
-        concat_features = torch.cat(proj_feats, dim=1)  # (B, 256*4, Ht, Wt)
-        decoder_output = self.decode_head.linear_fuse(concat_features)
-        decoder_output = self.decode_head.batch_norm(decoder_output)
-        decoder_output = self.decode_head.activation(decoder_output)
-        decoder_output = self.decode_head.dropout(decoder_output)
-        logits = self.decode_head.classifier(decoder_output)
         logits_upsampled = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
 
-        # 特征对齐
         feat_b30_aligned = self.align_block30(feat_stage3)
         feat_enc_aligned = self.align_encoder(feat_stage4)
 
