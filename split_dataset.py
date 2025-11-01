@@ -6,8 +6,9 @@ import os
 import random
 from pathlib import Path
 from config import cfg
+import numpy as np
 
-
+ENABLE_SHAPE_CHECK = True  # 想关闭就改成 False
 def split_dataset(seed=42):
     """
     划分数据集为train/val/test
@@ -142,6 +143,10 @@ def load_split(split='train'):
 
     return img_ids
 
+def quick_probe_feat(npz_path, key='features'):
+    with np.load(npz_path) as f:
+        arr = f[key][0]  # 取第0条（你现在的存储方式）
+    return arr.shape
 
 def check_data_integrity():
     """
@@ -160,19 +165,42 @@ def check_data_integrity():
 
         missing_labels = []
         missing_features = []
+        badshape_features = []  # 新增：形状不匹配的样本
 
         for img_id in img_ids:
-            # 检查标签
+            # 1) 标签存在性
             label_path = cfg.LABEL_DIR / f"{img_id}.png"
             if not label_path.exists():
                 missing_labels.append(img_id)
 
-            # 检查特征
-            feat30_path = cfg.FEATURE_BLOCK30_DIR / f"{img_id}.npz"  # 使用新名字
-            feat_enc_path = cfg.FEATURE_ENCODER_DIR / f"{img_id}.npz"  # 使用新名字
-            if not feat30_path.exists() or not feat_enc_path.exists():
-                missing_features.append(img_id)
+            # 2) 特征存在性
+            feat30_path = cfg.FEATURE_BLOCK30_DIR / f"{img_id}.npz"
+            feat_enc_path = cfg.FEATURE_ENCODER_DIR / f"{img_id}.npz"
+            has_feat30 = feat30_path.exists()
+            has_featenc = feat_enc_path.exists()
 
+            if not (has_feat30 and has_featenc):
+                missing_features.append(img_id)
+                continue  # 没文件就别做形状检查，避免双重计数
+
+            # 3) （可选）形状检查：只在文件都存在时进行
+            if ENABLE_SHAPE_CHECK:
+                try:
+                    shp30 = quick_probe_feat(feat30_path)  # 你目前导出是 (64,64,1280)
+                    shpenc = quick_probe_feat(feat_enc_path)  # 你目前导出是 (256,64,64)
+
+                    # 允许 B30 两种存储习惯：HWC 或 CHW（更稳妥）
+                    ok30 = (shp30 == (64, 64, cfg.TEACHER_FEAT_30_DIM)) or \
+                           (shp30 == (cfg.TEACHER_FEAT_30_DIM, 64, 64))
+
+                    # Encoder 期望 (C, H, W)；如果你可能存成 HWC，也放宽一下
+                    okenc = (shpenc == (cfg.TEACHER_FEAT_31_DIM, 64, 64)) or \
+                            (shpenc == (64, 64, cfg.TEACHER_FEAT_31_DIM))
+
+                    if not (ok30 and okenc):
+                        badshape_features.append((img_id, shp30, shpenc))
+                except Exception as e:
+                    badshape_features.append((img_id, 'read_error', str(e)))
 
         # 报告结果
         print(f"  总数: {len(img_ids)}")
@@ -188,7 +216,12 @@ def check_data_integrity():
             all_valid = False
         else:
             print(f"  ✓ 特征完整")
-
+        if ENABLE_SHAPE_CHECK:
+            if badshape_features:
+                print(f"  ✗ 特征形状不匹配: {len(badshape_features)}，示例: {badshape_features[:5]}")
+                all_valid = False
+            else:
+                print("  ✓ 特征形状匹配")
 
     print("\n" + "=" * 60)
     if all_valid:

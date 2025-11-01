@@ -68,25 +68,33 @@ class DistillationLoss(nn.Module):
         self.dice_loss = DiceLoss()
         self.feat_loss = FeatureLoss()
 
-        self.w_seg      = cfg.get('LOSS_SEG_WEIGHT',      1.0)
-        self.w_feat_b30 = cfg.get('LOSS_FEAT_B30_WEIGHT', 0.5)
-        self.w_feat_enc = cfg.get('LOSS_FEAT_ENC_WEIGHT', 0.5)
+        # ✅ 正确
+        self.w_seg = getattr(cfg, 'LOSS_SEG_WEIGHT', 1.0)
+        self.w_feat_b30 = getattr(cfg, 'LOSS_FEAT_B30_WEIGHT', 0.5)
+        self.w_feat_enc = getattr(cfg, 'LOSS_FEAT_ENC_WEIGHT', 0.5)
 
     def forward(self, outputs, targets):
         pred      = outputs['pred']                  # (B,1,H,W)
         device = pred.device
-        gt_label  = targets['label']                 # (B,H,W)
+        gt_label = targets['label'].to(pred.device)  # ✅ 现在拿到的gt_label直接就是二值的了！              # (B,H,W)
         mask      = (gt_label != IGNORE_INDEX).to(pred.device)   # bool
-        gt_binary = (gt_label > 0).float().to(pred.device)       # (B,H,W)
+        gt_binary = gt_label.float()  # ✅ 不再需要 (gt_label > 0) 的转换！
 
         # 1. Seg Loss
         mask_4d   = mask.unsqueeze(1).float()        # (B,1,H,W)
         loss_dice = self.dice_loss(pred, gt_binary.unsqueeze(1), mask_4d)
 
-        bce_map = F.binary_cross_entropy_with_logits(
-            pred.squeeze(1), gt_binary, reduction='none'
+        valid = mask.bool()
+        loss_bce = F.binary_cross_entropy_with_logits(
+            pred.squeeze(1)[valid],
+            gt_binary[valid],
+            reduction='mean'
         )
-        loss_bce = (bce_map * mask).sum() / mask.sum().clamp_min(1)# 手动均值
+        pos_weight = getattr(cfg, 'BCE_POS_WEIGHT', None)
+        if pos_weight is not None:
+            self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
+            loss_bce = self.bce_loss(pred.squeeze(1)[valid], gt_binary[valid])
+
         loss_seg  = loss_bce + loss_dice
 
         # 2. Feature KD
@@ -130,9 +138,10 @@ if __name__ == '__main__':
     }
 
     # 监督信号 (新增 255 ignore 区域)
-    label = torch.randint(0, 7, (B, H, W))
-    # ✅ 将所有值为6的像素，替换为我们的IGNORE_INDEX(255)
-    label[label == 6] = IGNORE_INDEX
+    # 先生成二值，再打一些 ignore
+    label = torch.randint(0, 2, (B, H, W))  # {0,1}
+    ignore_mask = torch.rand(B, H, W) < 0.1  # 10% 像素忽略（示例）
+    label[ignore_mask] = IGNORE_INDEX  # 255
 
     targets = {
         'label': label,

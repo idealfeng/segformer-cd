@@ -4,23 +4,26 @@
 import os
 from pathlib import Path
 
-from distributed.protocol import torch
+import torch  # <--- 这才是正确的写法！
 
 
 class Config:
     """训练和评估配置"""
 
     # ==================== 路径配置 ====================
-    # 项目根目录（修改为你的实际路径）
+    # 以当前文件所在目录为项目根目录（修改为你的实际路径）
     PROJECT_ROOT = Path(__file__).parent.resolve()
 
+    # 定义一个所有数据的“根”，指向 "data" 文件夹
+    DATA_PARENT_DIR = PROJECT_ROOT / "data"
+
     # 数据路径
-    DATA_ROOT = PROJECT_ROOT / "Potsdam_processed"
+    DATA_ROOT = DATA_PARENT_DIR / "Potsdam_processed"
     IMAGE_DIR = DATA_ROOT / "images"
     LABEL_DIR = DATA_ROOT / "labels"
 
     # 教师网络输出路径
-    TEACHER_ROOT = PROJECT_ROOT / "data/teacher_outputs"
+    TEACHER_ROOT = DATA_PARENT_DIR / "teacher_outputs"
     FEATURE_BLOCK30_DIR = TEACHER_ROOT / "features_block30"
     FEATURE_ENCODER_DIR = TEACHER_ROOT / "features_encoder"
 
@@ -33,7 +36,7 @@ class Config:
     RESULTS_DIR = OUTPUT_ROOT / "results"
 
     # 数据集划分文件
-    SPLIT_DIR = PROJECT_ROOT / "splits"
+    SPLIT_DIR = DATA_PARENT_DIR / "splits"
     TRAIN_LIST = SPLIT_DIR / "train.txt"
     VAL_LIST = SPLIT_DIR / "val.txt"
     TEST_LIST = SPLIT_DIR / "test.txt"
@@ -53,10 +56,11 @@ class Config:
     IMAGE_SIZE = 1024
 
     # 类别数（根据Potsdam调整）
-    NUM_CLASSES = 6  # Potsdam: 建筑、道路、树木、草地、车辆、背景
+    NUM_CLASSES = 2  # 前景背景
+    NUM_CLASSES_DATA=6 # 原始数据集
 
     # 类别名称
-    CLASS_NAMES = [
+    CLASS_NAMES_DATA = [
         'Impervious surfaces',  # Class 0
         'Building',  # Class 1
         'Low vegetation',  # Class 2
@@ -66,13 +70,23 @@ class Config:
     ]
 
     # 类别颜色（用于可视化）
-    CLASS_COLORS = [
+    CLASS_COLORS_DATA = [
         [255, 255, 255],  # 白色 - Impervious
         [0, 0, 255],  # 蓝色 - Building
         [0, 255, 255],  # 青色 - Low vegetation
         [0, 255, 0],  # 绿色 - Tree
         [255, 255, 0],  # 黄色 - Car
         [255, 0, 0]  # 红色 - Background
+    ]
+
+    CLASS_NAMES = [
+        'Background',  # Class 0
+        'Foreground'  # Class 1（所有非背景区域）
+    ]
+
+    CLASS_COLORS = [
+        [0, 0, 0],  # 黑色 - 背景
+        [255, 255, 255]  # 白色 - 前景
     ]
 
     # ==================== 模型配置 ====================
@@ -82,7 +96,7 @@ class Config:
 
     # 教师网络特征维度
     TEACHER_FEAT_30_DIM = 1280  # Block 30
-    TEACHER_FEAT_31_DIM = 256  # Block 31
+    TEACHER_FEAT_ENCODER_DIM = 256  # Block 31
 
     # ==================== 训练配置 ====================
     # 基础训练参数
@@ -91,6 +105,9 @@ class Config:
     NUM_WORKERS = 4  # 数据加载线程数
     USE_AMP = True
 
+    # 可选：添加梯度累积（新增）
+    GRADIENT_ACCUMULATION_STEPS = 2  # 等效batch_size=8
+
     # 优化器参数
     OPTIMIZER = "adamw"
     LEARNING_RATE = 6e-5
@@ -98,10 +115,10 @@ class Config:
     BETAS = (0.9, 0.999)
 
     # 学习率调度
-    LR_SCHEDULER = "polynomial"  # 或 "cosine"
+    LR_SCHEDULER = "polynomial"  # 或 "cosine"，此处是多项式衰减
     LR_POWER = 0.9
-    WARMUP_EPOCHS = 5
-    WARMUP_LR = 1e-6
+    WARMUP_EPOCHS = 5       # 前5个epoch较小学习率
+    WARMUP_LR = 1e-6        # 初始学习率
 
     # 损失函数权重
     # 阶段一：二分类分割蒸馏

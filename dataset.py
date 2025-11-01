@@ -26,6 +26,7 @@ class DistillationDataset(Dataset):
         self.split = split
         self.use_augmentation = use_augmentation and (split == 'train')
         self.img_ids = load_split(split)
+        # 几何增强，图像增强，图像归一化张量化掩码转张量
         self.geo_transform, self.color_transform, self.post_transform = self.get_transforms()
         print(f"加载 {split} 集: {len(self.img_ids)} 张图像, 数据增强: {self.use_augmentation}")
 
@@ -39,13 +40,17 @@ class DistillationDataset(Dataset):
         label = self.load_label(img_id)
         teacher_feat_b30, teacher_feat_enc = self.load_teacher_features(img_id)
 
+        binary_label = np.zeros_like(label, dtype=np.uint8)
+        binary_label[label > 0] = 1  # 所有前景类都变成1
+        binary_label[label == IGNORE_LABEL] = IGNORE_LABEL  # 保持ignore_index
+
         # 统一将特征转为(H, W, C)以适配Albumentations
         feat_b30_hwc = np.transpose(teacher_feat_b30, (1, 2, 0))
         feat_enc_hwc = np.transpose(teacher_feat_enc, (1, 2, 0))
 
         if self.use_augmentation:
-            res = self.geo_transform(image=image, mask=label)
-            image, label, replay = res['image'], res['mask'], res['replay']
+            res = self.geo_transform(image=image, mask=binary_label)  # ✅ 改为binary_label
+            image, binary_label, replay = res['image'], res['mask'], res['replay']  # ✅ 改变量名
 
             # 回放到特征
             feat_b30_aug_hwc = A.ReplayCompose.replay(replay, image=feat_b30_hwc)['image']
@@ -57,11 +62,11 @@ class DistillationDataset(Dataset):
             teacher_feat_b30 = np.transpose(feat_b30_aug_hwc, (2, 0, 1))
             teacher_feat_enc = np.transpose(feat_enc_aug_hwc, (2, 0, 1))
 
-        post_res = self.post_transform(image=image, mask=label)
-        image, label = post_res['image'], post_res['mask']
+        augmented = self.post_transform(image=image, mask=binary_label)  # ✅ 现在一致了
+        image = augmented['image']
+        binary_label = augmented['mask']  # ✅ 改变量名保持一致
 
-        label = label.long()
-        # ✅ 修复4: 使用 .copy() 和 astype 确保内存连续性和正确的dtype
+        label = binary_label.squeeze(0).long()  # ✅ 最终返回  # ✅ 修复4: 使用 .copy() 和 astype 确保内存连续性和正确的dtype
         teacher_feat_b30 = torch.from_numpy(teacher_feat_b30.copy().astype(np.float32)).float()
         teacher_feat_enc = torch.from_numpy(teacher_feat_enc.copy().astype(np.float32)).float()
 
@@ -90,9 +95,15 @@ class DistillationDataset(Dataset):
     def load_teacher_features(self, img_id):
         feat30_path = cfg.FEATURE_BLOCK30_DIR / f"{img_id}.npz"
         feat_enc_path = cfg.FEATURE_ENCODER_DIR / f"{img_id}.npz"
-        # 已经是(C,H,W)格式
-        feat30 = np.load(feat30_path)['features'][0]
-        feat_enc = np.load(feat_enc_path)['features'][0]
+
+        feat30 = np.load(feat30_path)['features'][0]  # (64, 64, 1280)
+        feat_enc = np.load(feat_enc_path)['features'][0]  # (256, 64, 64)
+
+        # ✅ Block30是(H, W, C)，转为(C, H, W)
+        feat30 = np.transpose(feat30, (2, 0, 1))  # → (1280, 64, 64)
+
+        # ✅ Encoder已经是(C, H, W)，不需要转换
+
         return feat30, feat_enc
 
     def get_transforms(self):
