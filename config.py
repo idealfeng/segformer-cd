@@ -62,6 +62,7 @@ class Config:
 
     # Ignore标签
     IGNORE_LABEL = 255  # 用于标记无效区域
+    IGNORE_INDEX = 255  # 用于损失函数
 
     # 类别名称
     CLASS_NAMES_DATA = [

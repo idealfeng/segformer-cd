@@ -102,6 +102,17 @@ class Visualizer:
 
         return image
 
+    """
+    该方法绘制四个子图：
+
+    输入图像。
+    
+    Ground Truth（真实标签），通过 mask_to_color 将标签转为颜色图。
+    
+    预测结果，同样通过 mask_to_color 处理。
+    
+    Overlay，将预测结果与原图叠加
+    """
     def plot_comparison(self, image, label, pred, save_path):
         """绘制对比图"""
         fig, axes = plt.subplots(1, 4, figsize=(20, 5))
@@ -133,6 +144,9 @@ class Visualizer:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
 
+    """
+    将二值化的掩码转换为 RGB 彩色图像，背景为黑色，前景为绿色，忽略区域为灰色。
+    """
     def mask_to_color(self, mask):
         """将mask转换为彩色图"""
         # 创建RGB图像
@@ -162,7 +176,7 @@ class Visualizer:
 
     @torch.no_grad()
     def compute_error_map(self, num_samples=5, save_dir='outputs/error_analysis'):
-        """计算错误分析图"""
+        """计算错误分析图,默认5张"""
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -186,6 +200,9 @@ class Visualizer:
 
             image = self.denormalize_image(images[0])
 
+            """
+            True Positive (TP)、False Positive (FP) 和 False Negative (FN) 区域分别用不同颜色（绿色、红色和蓝色）标记，并与原图一起展示。
+            """
             # 错误分析
             self.plot_error_analysis(
                 image, labels, pred,
@@ -250,7 +267,7 @@ def main():
                         help='可视化样本数量')
     parser.add_argument('--save-dir', type=str, default='outputs/visualizations',
                         help='保存目录')
-    parser.add_argument('--error-analysis', action='store_true',
+    parser.add_argument('--error-analysis', action='store_true',default=False,
                         help='是否生成错误分析图')
     args = parser.parse_args()
 
