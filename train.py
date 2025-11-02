@@ -45,6 +45,7 @@ class Trainer:
     def __init__(self, args):
         self.args = args
         self.device = torch.device(cfg.DEVICE if torch.cuda.is_available() else 'cpu')
+        self.no_distillation = args.no_distillation  # ← 添加这行
 
         # 创建输出目录
         self.setup_dirs()
@@ -172,10 +173,27 @@ class Trainer:
             }
 
             if cfg.USE_AMP:
-                # 可以自动地、在你认为安全的地方，把计算从Float32切换到Float16去跑
                 with autocast():
                     outputs = self.model(images)
-                    loss, loss_dict = self.criterion(outputs, targets)
+
+                    # ========== 添加蒸馏开关 ==========
+                    if self.no_distillation:
+                        # 只用分割损失
+                        import torch.nn.functional as F
+                        pred = outputs['pred']
+                        labels_float = targets['label'].unsqueeze(1).float()
+                        loss_seg = F.binary_cross_entropy_with_logits(pred, labels_float)
+
+                        loss = loss_seg
+                        loss_dict = {
+                            'seg': loss_seg.item(),
+                            'feat_b30': 0.0,
+                            'feat_enc': 0.0
+                        }
+                    else:
+                        # 正常蒸馏
+                        loss, loss_dict = self.criterion(outputs, targets)
+                    # ========== 修改结束 ==========
 
                 # ✅ 缩放loss
                 loss = loss / cfg.GRADIENT_ACCUMULATION_STEPS
@@ -191,9 +209,22 @@ class Trainer:
 
                     # 学习率调度（移到这里）
                     self.scheduler.step()
+
             else:
                 outputs = self.model(images)
-                loss, loss_dict = self.criterion(outputs, targets)
+                if self.no_distillation:
+                    import torch.nn.functional as F
+                    pred = outputs['pred']
+                    labels_float = targets['label'].unsqueeze(1).float()
+                    loss_seg = F.binary_cross_entropy_with_logits(pred, labels_float)
+                    loss = loss_seg
+                    loss_dict = {
+                        'seg': loss_seg.item(),
+                        'feat_b30': 0.0,
+                        'feat_enc': 0.0
+                    }
+                else:
+                    loss, loss_dict = self.criterion(outputs, targets)
 
                 # ✅ 缩放loss
                 loss = loss / cfg.GRADIENT_ACCUMULATION_STEPS
@@ -255,8 +286,18 @@ class Trainer:
             }
 
             # 前向传播
+            # 前向传播
             outputs = self.model(images)
-            loss, _ = self.criterion(outputs, targets)
+
+            # ========== 添加蒸馏开关 ==========
+            if self.no_distillation:
+                import torch.nn.functional as F
+                pred = outputs['pred']
+                labels_float = labels.unsqueeze(1).float()
+                loss = F.binary_cross_entropy_with_logits(pred, labels_float)
+            else:
+                loss, _ = self.criterion(outputs, targets)
+            # ========== 修改结束 ==========
 
             total_loss += loss.item()
 
