@@ -83,9 +83,9 @@ pip install tensorboard  # 可视化（可选）
 python split_dataset.py
 
 # 输出：
-# splits/train.txt (1680张, 70%)
-# splits/val.txt (360张, 15%)
-# splits/test.txt (360张, 15%)
+# splits1/train.txt (1680张, 70%)
+# splits1/val.txt (360张, 15%)
+# splits1/test.txt (360张, 15%)
 ```
 
 ### 阶段2：Baseline评估（5个对比方法）

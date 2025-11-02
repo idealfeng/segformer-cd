@@ -48,9 +48,9 @@ class Config:
 
     # ==================== 数据配置 ====================
     # 数据集划分比例
-    TRAIN_RATIO = 0.70  # 1680张
-    VAL_RATIO = 0.15  # 360张
-    TEST_RATIO = 0.15  # 360张
+    TRAIN_RATIO = 0.70
+    VAL_RATIO = 0.15
+    TEST_RATIO = 0.15
 
     # 图像尺寸
     IMAGE_SIZE = 1024
@@ -102,6 +102,9 @@ class Config:
     # 教师网络特征维度
     TEACHER_FEAT_BLOCK30_DIM = 1280  # Block 30
     TEACHER_FEAT_ENCODER_DIM = 256  # Block 31
+
+    # SAM将1024×1024输入下采样到64×64
+    TEACHER_FEAT_SIZE = 64  # 特征图空间尺寸
 
     # ==================== 训练配置 ====================
     # 基础训练参数

@@ -51,13 +51,14 @@ def split_dataset(seed=42):
 
     # 计算划分点
     total = len(orig_names)
-    train_end = int(total * cfg.TRAIN_RATIO)
-    val_end = train_end + int(total * cfg.VAL_RATIO)
+    val_count = int(total * cfg.VAL_RATIO)
+    test_count = int(total * cfg.TEST_RATIO)
+    train_count = total - val_count - test_count  # ← 剩余的全给训练集
 
     # 划分原图
-    train_orig = orig_names[:train_end]
-    val_orig = orig_names[train_end:val_end]
-    test_orig = orig_names[val_end:]
+    train_orig = orig_names[:train_count]
+    val_orig = orig_names[train_count:train_count + val_count]
+    test_orig = orig_names[train_count + val_count:]
 
     # 收集所有patch
     train_list = []
@@ -190,12 +191,12 @@ def check_data_integrity():
                     shpenc = quick_probe_feat(feat_enc_path)  # 你目前导出是 (256,64,64)
 
                     # 允许 B30 两种存储习惯：HWC 或 CHW（更稳妥）
-                    ok30 = (shp30 == (64, 64, cfg.TEACHER_FEAT_30_DIM)) or \
-                           (shp30 == (cfg.TEACHER_FEAT_30_DIM, 64, 64))
+                    ok30 = (shp30 == (64, 64, cfg.TEACHER_FEAT_BLOCK30_DIM)) or \
+                           (shp30 == (cfg.TEACHER_FEAT_BLOCK30_DIM, 64, 64))
 
                     # Encoder 期望 (C, H, W)；如果你可能存成 HWC，也放宽一下
-                    okenc = (shpenc == (cfg.TEACHER_FEAT_31_DIM, 64, 64)) or \
-                            (shpenc == (64, 64, cfg.TEACHER_FEAT_31_DIM))
+                    okenc = (shpenc == (cfg.TEACHER_FEAT_ENCODER_DIM, 64, 64)) or \
+                            (shpenc == (64, 64, cfg.TEACHER_FEAT_ENCODER_DIM))
 
                     if not (ok30 and okenc):
                         badshape_features.append((img_id, shp30, shpenc))

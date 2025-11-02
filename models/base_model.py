@@ -122,11 +122,16 @@ class BaseModel(nn.Module):
 
         for batch_idx, batch in enumerate(pbar):
             images = batch['image'].to(self.device)
-            labels = batch['label'].cpu().numpy()
+            labels_tensor = batch['label'].to(self.device)  # ← 保留tensor用于SAM
+            labels = labels_tensor.cpu().numpy()  # ← numpy用于后续统计
 
             # Warm-up
             if compute_fps and batch_idx < num_warmup:
-                _ = self.forward(images)
+                # SAM需要labels生成GT-guided box
+                if hasattr(self, 'sam'):
+                    _ = self.forward(images, labels=labels_tensor)
+                else:
+                    _ = self.forward(images)
                 pbar.set_postfix({'status': f'Warming up... {batch_idx + 1}/{num_warmup}'})
                 continue
 
@@ -140,7 +145,11 @@ class BaseModel(nn.Module):
                 start_time = time.time()
 
             # 前向传播
-            logits = self.forward(images)
+            # SAM需要labels生成GT-guided box
+            if hasattr(self, 'sam'):
+                logits = self.forward(images, labels=labels_tensor)
+            else:
+                logits = self.forward(images)
 
             # 计时结束
             if compute_fps and measure_count < num_measure:

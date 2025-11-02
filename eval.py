@@ -176,8 +176,22 @@ class Evaluator:
         all_preds = np.array(all_preds, dtype=np.uint8)
         all_labels = np.array(all_labels, dtype=np.uint8)
 
-        # 计算指标
-        metrics = self.compute_metrics(all_preds, all_labels)
+        # 分批计算，避免内存爆炸
+        all_preds_flat = []
+        all_labels_flat = []
+
+        batch_size = 50  # 每次处理50张图
+        for i in range(0, len(all_preds), batch_size):
+            batch_preds = all_preds[i:i + batch_size].flatten()
+            batch_labels = all_labels[i:i + batch_size].flatten()
+            all_preds_flat.append(batch_preds)
+            all_labels_flat.append(batch_labels)
+
+        # 合并（这样分批append，内存占用更小）
+        all_preds_flat = np.concatenate(all_preds_flat)
+        all_labels_flat = np.concatenate(all_labels_flat)
+
+        metrics = self.compute_metrics(all_preds_flat, all_labels_flat)
 
         # ✅ 优化3: 更准确的FPS统计
         if compute_fps and len(latency_list) > 0:
