@@ -6,6 +6,9 @@
     python visualize.py --checkpoint outputs/checkpoints/best.pth --num-samples 10
     python visualize.py --checkpoint outputs/checkpoints/best.pth --save-all
 """
+import matplotlib
+matplotlib.use('Agg')  # 无GUI环境
+import matplotlib.pyplot as plt
 import argparse
 import torch
 import numpy as np
@@ -60,7 +63,7 @@ class Visualizer:
         print("=" * 60)
 
         count = 0
-        pbar = tqdm(self.test_loader, total=num_samples)
+        pbar = tqdm(self.test_loader, total=min(num_samples, len(self.test_loader)))
 
         for batch_idx, batch in enumerate(pbar):
             if count >= num_samples:
@@ -90,8 +93,8 @@ class Visualizer:
     def denormalize_image(self, tensor):
         """反归一化"""
         # ImageNet mean/std
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(tensor.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(tensor.device)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device)[:, None, None]
+        std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device)[:, None, None]
 
         image = tensor * std + mean
         image = image.clamp(0, 1)
@@ -168,7 +171,7 @@ class Visualizer:
         print("=" * 60)
 
         count = 0
-        pbar = tqdm(self.test_loader, total=num_samples)
+        pbar = tqdm(self.test_loader, total=min(num_samples, len(self.test_loader)))
 
         for batch_idx, batch in enumerate(pbar):
             if count >= num_samples:

@@ -104,13 +104,13 @@ class Config:
 
     # ==================== 训练配置 ====================
     # 基础训练参数
-    BATCH_SIZE = 16 # 4060 8G显存可以用8
+    BATCH_SIZE = 4# 4060 8G显存可以用8
     NUM_EPOCHS = 100  # 可以调整到150-200
     NUM_WORKERS = 4  # 数据加载线程数
     USE_AMP = True
 
     # 可选：添加梯度累积（新增）
-    GRADIENT_ACCUMULATION_STEPS = 4# 等效batch_size=4
+    GRADIENT_ACCUMULATION_STEPS = 2# 等效batch_size=4
 
     # 优化器参数
     OPTIMIZER = "adamw"
