@@ -47,7 +47,7 @@ class Evaluator:
         # ✅ 优化1: 使用更大的batch_size
         self.test_loader = build_dataloader(
             'test',
-            batch_size=self.batch_size,  # 原来是1，现在是4
+            batch_size=self.batch_size,  # 原来是1，现在是4，此处只影响评估速度
             shuffle=False
         )
         print(f"测试集: {len(self.test_loader.dataset)} 张")

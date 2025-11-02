@@ -2,6 +2,12 @@
 基础模型类 - 统一接口
 为Phase 3的6个对比模型提供统一的forward和evaluate接口
 """
+import sys
+from pathlib import Path
+
+# ✅ 添加项目根目录到Python路径
+project_root = Path(__file__).parent.parent  # models/ → project/
+sys.path.insert(0, str(project_root))
 import torch
 import torch.nn as nn
 import numpy as np

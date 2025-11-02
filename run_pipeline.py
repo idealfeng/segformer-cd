@@ -26,39 +26,39 @@
 
 场景1：完整训练（推荐配置）
 # 100 epochs完整训练 + 精确评估
-python run_pipeline.py --epochs 100 \
-                       --batch-size 4 \
-                       --compute-fps \
-                       --num-warmup 20 \
-                       --num-vis 10 \
+python run_pipeline.py --epochs 100 `
+                       --batch-size 4 `
+                       --compute-fps `
+                       --num-warmup 20 `
+                       --num-vis 10 `
                        --error-analysis
 
 场景2：快速测试（3 epochs）
 # 快速验证流程
-python run_pipeline.py --epochs 3 \
-                       --batch-size 2 \
+python run_pipeline.py --epochs 3 `
+                       --batch-size 2 `
                        --num-vis 5
 
 
 场景3：只评估现有模型
 # 评估3 epochs的模型
-python run_pipeline.py --skip-train \
-                       --checkpoint outputs/checkpoints/best.pth \
-                       --batch-size 4 \
+python run_pipeline.py --skip-train `
+                       --checkpoint outputs/checkpoints/best.pth `
+                       --batch-size 4 `
                        --compute-fps
 
 场景4：恢复中断的训练
 # 从epoch 50继续训练到100
-python run_pipeline.py --epochs 100 \
+python run_pipeline.py --epochs 100 `
                        --resume outputs/checkpoints/epoch_50.pth
 
 
 场景5：批量评估多个checkpoint
 # 评估epoch 0, 1, 2
 for epoch in 0 1 2; do
-    python run_pipeline.py --skip-train \
-                           --checkpoint outputs/checkpoints/epoch_${epoch}.pth \
-                           --batch-size 4 \
+    python run_pipeline.py --skip-train `
+                           --checkpoint outputs/checkpoints/epoch_${epoch}.pth `
+                           --batch-size 4 `
                            --skip-vis
 done
 """
