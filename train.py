@@ -6,29 +6,54 @@
     python train.py                    # 完整训练
     python train.py --epochs 5         # 快速测试
     python train.py --resume best.pth  # 恢复训练
+    python train.py --no-distillation  # 不使用蒸馏（消融实验）
 """
 import os
 os.environ['ALBUMENTATIONS_CHECK_VERSION'] = 'False'
-
-# --- 你原来的 import 语句 ---
+from losses.losses import DistillationLossWithTricks
 import argparse
 from pathlib import Path
 from tqdm import tqdm
 import torch
-import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 import json
-from datetime import datetime
-# ✅ 新增: 导入 random 和 numpy
 import random
 import numpy as np
 from config import cfg
 from dataset import build_dataloader
 from models.segformer import build_segformer_distillation
-from losses import DistillationLoss
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
+
+
+def compute_seg_loss_only(pred, labels, ignore_index=255):
+    """
+    计算纯分割损失（不含蒸馏），正确处理ignore区域
+
+    Args:
+        pred: (B, 1, H, W) - 模型预测logits
+        labels: (B, H, W) - 标签（0=背景, 1=前景, 255=ignore）
+        ignore_index: 忽略标签值
+
+    Returns:
+        loss: BCE损失（只在有效区域）
+    """
+    import torch.nn.functional as F
+
+    # 过滤ignore区域
+    mask = (labels != ignore_index).unsqueeze(1).float()  # (B, 1, H, W)
+    labels_binary = (labels > 0).unsqueeze(1).float()  # (B, 1, H, W)
+
+    # 只在有效区域计算BCE
+    loss = F.binary_cross_entropy_with_logits(
+        pred * mask,
+        labels_binary * mask,
+        reduction='sum'
+    ) / (mask.sum() + 1e-6)
+
+    return loss
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -36,16 +61,17 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        # 确保cudnn的确定性，可能会牺牲一点点性能
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
 class Trainer:
     """训练器"""
 
     def __init__(self, args):
         self.args = args
         self.device = torch.device(cfg.DEVICE if torch.cuda.is_available() else 'cpu')
-        self.no_distillation = args.no_distillation  # ← 添加这行
+        self.no_distillation = args.no_distillation
 
         # 创建输出目录
         self.setup_dirs()
@@ -53,30 +79,32 @@ class Trainer:
         # 初始化模型
         print("=" * 60)
         print("初始化训练...")
+        if self.no_distillation:
+            print("⚠️ 消融实验模式：不使用蒸馏")
         print("=" * 60)
         self.model = self.build_model()
 
         # 数据加载器
         actual_batch_size = cfg.BATCH_SIZE // cfg.GRADIENT_ACCUMULATION_STEPS
         if actual_batch_size == 0:
-            actual_batch_size = 1 # 至少为1
+            actual_batch_size = 1
 
         self.train_loader = build_dataloader('train', batch_size=actual_batch_size, shuffle=True)
-        self.val_loader = build_dataloader('val', batch_size=1, shuffle=False) # 验证集通常用batch=1
+        self.val_loader = build_dataloader('val', batch_size=1, shuffle=False)
 
         print(f"训练集: {len(self.train_loader.dataset)} 张")
         print(f"验证集: {len(self.val_loader.dataset)} 张")
-        # ✅ Point 2 (优化): 打印信息更清晰
         print(f"全局Batch Size: {cfg.BATCH_SIZE}")
         print(f"物理Batch Size (per step): {actual_batch_size}")
         print(f"梯度累积步数: {cfg.GRADIENT_ACCUMULATION_STEPS}")
         print(f"设备: {self.device}")
+
         # 优化器和调度器
         self.optimizer = self.build_optimizer()
         self.scheduler = self.build_scheduler()
 
-        # 损失函数（BCE+Dice + 两路 MSE 蒸馏）
-        self.criterion = DistillationLoss()
+        # 损失函数
+        self.criterion = DistillationLossWithTricks()
 
         # AMP
         self.scaler = GradScaler() if cfg.USE_AMP else None
@@ -133,10 +161,8 @@ class Trainer:
 
             def poly_lr_lambda(step):
                 if step < warmup_steps:
-                    # Warmup阶段
                     return float(step) / float(max(1, warmup_steps))
                 else:
-                    # Polynomial decay
                     decay_steps = total_steps - warmup_steps
                     progress = float(step - warmup_steps) / float(max(1, decay_steps))
                     return (1.0 - progress) ** cfg.LR_POWER
@@ -154,7 +180,6 @@ class Trainer:
 
     def train_epoch(self, epoch):
         """训练一个epoch"""
-
         self.model.train()
 
         total_loss = 0.0
@@ -163,11 +188,14 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{cfg.NUM_EPOCHS}")
 
         self.optimizer.zero_grad(set_to_none=True)
+
         for batch_idx, batch in enumerate(pbar):
             # 准备数据
             images = batch['image'].to(self.device)
+            labels = batch['label'].to(self.device)  # ✅ 提前定义labels
+
             targets = {
-                'label': batch['label'].to(self.device),
+                'label': labels,
                 'teacher_feat_b30': batch['teacher_feat_b30'].to(self.device),
                 'teacher_feat_enc': batch['teacher_feat_enc'].to(self.device)
             }
@@ -176,13 +204,13 @@ class Trainer:
                 with autocast():
                     outputs = self.model(images)
 
-                    # ========== 添加蒸馏开关 ==========
+                    # ========== 蒸馏开关 ==========
                     if self.no_distillation:
-                        # 只用分割损失
-                        import torch.nn.functional as F
                         pred = outputs['pred']
-                        labels_float = targets['label'].unsqueeze(1).float()
-                        loss_seg = F.binary_cross_entropy_with_logits(pred, labels_float)
+                        loss_seg = compute_seg_loss_only(
+                            pred, labels,
+                            ignore_index=cfg.IGNORE_INDEX
+                        )
 
                         loss = loss_seg
                         loss_dict = {
@@ -191,32 +219,33 @@ class Trainer:
                             'feat_enc': 0.0
                         }
                     else:
-                        # 正常蒸馏
                         loss, loss_dict = self.criterion(outputs, targets)
                     # ========== 修改结束 ==========
 
-                # ✅ 缩放loss
+                # 缩放loss
                 loss = loss / cfg.GRADIENT_ACCUMULATION_STEPS
 
-                # 反向传播,在反向传播之前，它把损失值乘以一个巨大的倍数（比如65536），防止精细的梯度在FP16下变成0。
+                # 反向传播
                 self.scaler.scale(loss).backward()
 
-                # ✅ 每N步更新一次参数
+                # 每N步更新一次参数
                 if (batch_idx + 1) % cfg.GRADIENT_ACCUMULATION_STEPS == 0:
-                    self.scaler.step(self.optimizer)        # 在更新权重之前，它会先检查梯度是否正常，然后自动地把放大的梯度缩回原来的大小，再让优化器去更新模型。
-                    self.scaler.update()                        # 如果发现梯度还是太小，下次就放得更大一点。
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
-
-                    # 学习率调度（移到这里）
                     self.scheduler.step()
 
             else:
                 outputs = self.model(images)
+
+                # ========== 蒸馏开关 ==========
                 if self.no_distillation:
-                    import torch.nn.functional as F
                     pred = outputs['pred']
-                    labels_float = targets['label'].unsqueeze(1).float()
-                    loss_seg = F.binary_cross_entropy_with_logits(pred, labels_float)
+                    loss_seg = compute_seg_loss_only(
+                        pred, labels,
+                        ignore_index=cfg.IGNORE_INDEX
+                    )
+
                     loss = loss_seg
                     loss_dict = {
                         'seg': loss_seg.item(),
@@ -225,20 +254,20 @@ class Trainer:
                     }
                 else:
                     loss, loss_dict = self.criterion(outputs, targets)
+                # ========== 修改结束 ==========
 
-                # ✅ 缩放loss
+                # 缩放loss
                 loss = loss / cfg.GRADIENT_ACCUMULATION_STEPS
 
                 # 反向传播
                 loss.backward()
 
-                # ✅ 每N步更新一次参数
+                # 每N步更新一次参数
                 if (batch_idx + 1) % cfg.GRADIENT_ACCUMULATION_STEPS == 0:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-
-                    # 学习率调度（移到这里）
                     self.scheduler.step()
+
             # 累计损失
             total_loss += loss.item()
             for key, value in loss_dict.items():
@@ -250,7 +279,7 @@ class Trainer:
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.6f}"
             })
 
-            # 记录到TensorBoard（每50步）
+            # 记录到TensorBoard
             if (batch_idx + 1) % cfg.GRADIENT_ACCUMULATION_STEPS == 0 and (
                     batch_idx // cfg.GRADIENT_ACCUMULATION_STEPS) % 25 == 0:
                 step = epoch * len(self.train_loader) + batch_idx
@@ -278,7 +307,8 @@ class Trainer:
 
         for batch in pbar:
             images = batch['image'].to(self.device)
-            labels = batch['label'].to(self.device)
+            labels = batch['label'].to(self.device)  # ✅ 提前定义labels
+
             targets = {
                 'label': labels,
                 'teacher_feat_b30': batch['teacher_feat_b30'].to(self.device),
@@ -286,15 +316,15 @@ class Trainer:
             }
 
             # 前向传播
-            # 前向传播
             outputs = self.model(images)
 
-            # ========== 添加蒸馏开关 ==========
+            # ========== 蒸馏开关 ==========
             if self.no_distillation:
-                import torch.nn.functional as F
                 pred = outputs['pred']
-                labels_float = labels.unsqueeze(1).float()
-                loss = F.binary_cross_entropy_with_logits(pred, labels_float)
+                loss = compute_seg_loss_only(
+                    pred, labels,
+                    ignore_index=cfg.IGNORE_INDEX
+                )
             else:
                 loss, _ = self.criterion(outputs, targets)
             # ========== 修改结束 ==========
@@ -302,8 +332,8 @@ class Trainer:
             total_loss += loss.item()
 
             # 计算IoU
-            pred = torch.sigmoid(outputs['pred']) > 0.5  # (B, 1, H, W)
-            pred = pred.squeeze(1).long()  # (B, H, W)
+            pred = torch.sigmoid(outputs['pred']) > 0.5
+            pred = pred.squeeze(1).long()
 
             # 二值化标签（过滤ignore）
             mask = (labels != 255)
@@ -327,8 +357,6 @@ class Trainer:
 
         return avg_loss, iou
 
-
-    #  注意点：resume 后学习率会跟随 scheduler_state_dict 恢复到历史的位置
     def save_checkpoint(self, epoch, iou, is_best=False):
         """保存checkpoint"""
         checkpoint = {
@@ -337,6 +365,7 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_iou': self.best_iou,
+            'no_distillation': self.no_distillation,  # ✅ 保存实验配置
             'config': {
                 'BATCH_SIZE': cfg.BATCH_SIZE,
                 'LEARNING_RATE': cfg.LEARNING_RATE,
@@ -352,12 +381,14 @@ class Trainer:
         torch.save(checkpoint, save_path)
         print(f"✓ 保存checkpoint: {save_path}")
 
-        max_keep = 5  # 你可以在config里定义这个值
+        # 清理旧checkpoint
+        max_keep = 5
         checkpoints = sorted(cfg.CHECKPOINT_DIR.glob('epoch_*.pth'), key=os.path.getmtime)
         if len(checkpoints) > max_keep:
             for old_ckpt in checkpoints[:-max_keep]:
                 old_ckpt.unlink()
                 print(f"✓ 清理旧checkpoint: {old_ckpt.name}")
+
         # 保存最优
         if is_best:
             best_path = cfg.CHECKPOINT_DIR / 'best.pth'
@@ -381,12 +412,6 @@ class Trainer:
         print(f"✓ 恢复训练从epoch {self.start_epoch}")
         print(f"✓ 最优IoU: {self.best_iou:.4f}")
 
-    """
-    每个 epoch：train_epoch → 写 TensorBoard（Train/loss_epoch 以及各项 loss 平均）
-    validate（按 VAL_FREQ）→ 写 Val/loss 与 Val/IoU
-    比较 val_iou 是否刷新 best；保存 epoch ckpt / best ckpt；early stopping 计数
-    最后打印 best_iou
-    """
     def train(self):
         """主训练循环"""
         print("\n" + "=" * 60)
@@ -448,15 +473,11 @@ class Trainer:
 
 
 def main():
-    """
-    --epochs: 让你可以在命令行临时覆盖配置文件里的训练轮数，进行快速测试，极其方便！
-    --resume: 提供了断点续训功能，如果训练意外中断，你可以用这个参数，从上次保存的地方继续，而不是从头再来。
-    set_seed(cfg.SEED): 在一切开始之前，锁定随机数，确保了实验的可复现性。
-    配置备份: 自动将本次运行的所有配置参数，保存为一个config.json文件
-    """
     parser = argparse.ArgumentParser(description='训练SegFormer蒸馏模型')
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
     parser.add_argument('--resume', type=str, default=None, help='恢复训练的checkpoint路径')
+    parser.add_argument('--no-distillation', action='store_true',
+                        help='不使用蒸馏，仅训练分割任务（消融实验）')
     args = parser.parse_args()
 
     set_seed(cfg.SEED)
@@ -480,6 +501,7 @@ def main():
 
     trainer = Trainer(args)
     trainer.train()
+
 
 if __name__ == '__main__':
     main()

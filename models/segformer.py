@@ -4,6 +4,7 @@ SegFormer模型 - 【v2.0 最终版】
 - ✅ 返回两层特征用于与SAM蒸馏
 - ✅ 内置特征对齐层，自动匹配SAM的维度
 """
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,16 +86,27 @@ class SegFormerDistillation(nn.Module):
         super().__init__()
 
         model_names = {f'b{i}': f'nvidia/mit-b{i}' for i in range(6)}
-        model_name = model_names[variant]
+        model_name_online = model_names[variant]
+
+        # 定义预训练模型的【相对路径】
+        local_weights_path = os.path.join("pretrained_weights", f"segformer_{variant}")
+
+        # 智能判断：如果本地路径存在，就用本地的；否则，从Hugging Face在线下载
+        if os.path.exists(local_weights_path):
+            print(f"✓ 发现本地预训练权重，从 '{local_weights_path}' 加载...")
+            model_name = local_weights_path
+        else:
+            print(f"本地权重未找到，将从Hugging Face Hub在线下载 '{model_name_online}'...")
+            model_name = model_name_online
+
+        # --- 修改结束 ---
 
         print(f"加载SegFormer-{variant.upper()}...")
         print(f"  任务: 二分类分割 (前景/背景)")
 
-        # ✅ 修复1: 【最重要】加载端到端模型，然后只取其backbone
-        # 这样做可以白嫖到它内部从序列reshape到4D图像特征的功能
         full_model = SegformerForSemanticSegmentation.from_pretrained(
             model_name,
-            num_labels=cfg.NUM_CLASSES,  # 从config读取，确保一致性
+            num_labels=cfg.NUM_CLASSES,
             ignore_mismatched_sizes=True
         )
         self.backbone = full_model.segformer

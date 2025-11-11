@@ -130,9 +130,15 @@ class Config:
 
     # 损失函数权重
     # 阶段一：二分类分割蒸馏
+    LOSS_WEIGHT_BOUNDARY = 0.0  # 可以调整这个值
     LOSS_SEG_WEIGHT = 1.0  # 分割损失 (例如 Dice/BCE Loss)
-    LOSS_FEAT_B30_WEIGHT = 0.5  # Block 30 特征蒸馏损失
-    LOSS_FEAT_ENC_WEIGHT = 0.5  # Encoder 特征蒸馏损失
+    LOSS_FEAT_B30_WEIGHT = 0.0  # Block 30 特征蒸馏损失
+    LOSS_FEAT_ENC_WEIGHT = 0.0  # Encoder 特征蒸馏损失
+    LOSS_WEIGHT_CONFIDENCE = 0.0
+
+    LOSS_WEIGHT_SEG =     LOSS_SEG_WEIGHT
+    LOSS_WEIGHT_FEAT_B30=    LOSS_FEAT_B30_WEIGHT
+    LOSS_WEIGHT_FEAT_ENC = LOSS_FEAT_ENC_WEIGHT
 
     # 训练配置新增
     USE_AMP = True  # 使用 Automatic Mixed Precision 加速并节省 VRAM

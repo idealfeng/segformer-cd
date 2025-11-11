@@ -1,5 +1,6 @@
 """
 # 快速评估（不计算FPS）
+python train.py --epochs 3
 python eval.py --checkpoint outputs/checkpoints/best.pth --batch-size 4
 
 # 完整评估（包括FPS，使用warm-up）
