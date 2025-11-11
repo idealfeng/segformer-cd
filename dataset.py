@@ -93,16 +93,24 @@ class DistillationDataset(Dataset):
         return label.astype(np.uint8)
 
     def load_teacher_features(self, img_id):
+        """加载教师特征（如果不存在则返回零特征）"""
         feat30_path = cfg.FEATURE_BLOCK30_DIR / f"{img_id}.npz"
         feat_enc_path = cfg.FEATURE_ENCODER_DIR / f"{img_id}.npz"
 
-        feat30 = np.load(feat30_path)['features'][0]  # (64, 64, 1280)
-        feat_enc = np.load(feat_enc_path)['features'][0]  # (256, 64, 64)
+        # ========== 关键修改：检查文件是否存在 ==========
+        if not feat30_path.exists() or not feat_enc_path.exists():
+            print(f"⚠️  警告：教师特征不存在，返回零特征（img_id={img_id}）")
+            # 返回全零特征
+            feat30 = np.zeros((1280, 64, 64), dtype=np.float32)
+            feat_enc = np.zeros((256, 64, 64), dtype=np.float32)
+            return feat30, feat_enc
+        # ========== 修改结束 ==========
 
-        # ✅ Block30是(H, W, C)，转为(C, H, W)
-        feat30 = np.transpose(feat30, (2, 0, 1))  # → (1280, 64, 64)
+        # 原来的加载逻辑
+        feat30 = np.load(feat30_path)['features'][0]
+        feat_enc = np.load(feat_enc_path)['features'][0]
 
-        # ✅ Encoder已经是(C, H, W)，不需要转换
+        feat30 = np.transpose(feat30, (2, 0, 1))
 
         return feat30, feat_enc
 
