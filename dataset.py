@@ -155,9 +155,16 @@ def get_train_transforms(crop_size: int = 256) -> A.Compose:
 
     # 高斯噪声
     if cfg.AUG_GAUSSIAN_NOISE:
-        transforms_list.append(
-            A.GaussNoise(var_limit=cfg.AUG_NOISE_VAR_LIMIT, p=0.3)
-        )
+        try:
+            # 新版本albumentations
+            transforms_list.append(
+                A.GaussNoise(std_range=(0.01, 0.05), p=0.3)
+            )
+        except TypeError:
+            # 旧版本albumentations
+            transforms_list.append(
+                A.GaussNoise(var_limit=cfg.AUG_NOISE_VAR_LIMIT, p=0.3)
+            )
 
     # 归一化和转换为tensor
     transforms_list.extend([
@@ -215,7 +222,7 @@ def get_test_transforms_full() -> A.Compose:
 
 def worker_init_fn(worker_id):
     """确保多进程数据加载的随机性"""
-    seed = np.random.get_state()[1][0] + worker_id
+    seed = int(np.random.get_state()[1][0]) + worker_id  # 转换为Python int
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
