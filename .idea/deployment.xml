@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="root@connect.bjb2.seetacloud.com:23258 password" remoteFilesAllowedToDisappearOnAutoupload="false" autoUploadExternalChanges="true">
+    <serverData>
+      <paths name="root@connect.bjb2.seetacloud.com:23258 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp/tricks" local="$PROJECT_DIR$" />
+          </mappings>
+          <excludedPaths>
+            <excludedPath local="true" path="$PROJECT_DIR$/project/data" />
+          </excludedPaths>
+        </serverdata>
+      </paths>
+      <paths name="root@connect.westc.gpuhub.com:37612 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/autodl-tmp/tricks" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
