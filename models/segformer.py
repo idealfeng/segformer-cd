@@ -218,9 +218,17 @@ class SegFormerCD(nn.Module):
         # 只取4个stage的最后输出，reshape为4D特征图
         features = []
         for i, idx in enumerate(stage_indices):
-            hidden_state = all_hidden[idx]  # (B, N, C)
-            B_, N, C_ = hidden_state.shape
-            feat = hidden_state.permute(0, 2, 1).reshape(B_, C_, h_sizes[i], w_sizes[i])
+            hidden_state = all_hidden[idx]
+
+            # 处理不同格式的hidden_state
+            if hidden_state.ndim == 3:
+                # (B, N, C) -> (B, C, H, W)
+                B_, N, C_ = hidden_state.shape
+                feat = hidden_state.permute(0, 2, 1).reshape(B_, C_, h_sizes[i], w_sizes[i])
+            else:
+                # 已经是 (B, C, H, W) 格式
+                feat = hidden_state
+
             features.append(feat)
 
         return features  # 长度4，对应4个尺度
