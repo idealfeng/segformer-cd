@@ -234,13 +234,18 @@ class SegFormerCD(nn.Module):
         features = []
         for i, hidden_state in enumerate(stage_outputs):
             # 处理不同格式的hidden_state
+            # 初始化feat以避免未定义错误
+            feat = None
+
             if hidden_state.ndim == 3:
                 # (B, N, C) -> (B, C, H, W)
                 B_, N, C_ = hidden_state.shape
                 feat = hidden_state.permute(0, 2, 1).reshape(B_, C_, h_sizes[i], w_sizes[i])
-            else:
+            elif hidden_state.ndim == 4:
                 # 已经是 (B, C, H, W) 格式
                 feat = hidden_state
+            else:
+                raise ValueError(f"Unexpected hidden_state ndim: {hidden_state.ndim}, shape: {hidden_state.shape}")
 
             features.append(feat)
 
