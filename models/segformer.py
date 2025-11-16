@@ -198,31 +198,41 @@ class SegFormerCD(nn.Module):
         )
 
         # 获取所有hidden states
-        # hidden_states 是每个encoder block的输出（不含embedding）
-        # 例如B1的depths=[2,2,2,2]，hidden_states长度=2+2+2+2=8
         all_hidden = outputs.hidden_states
         depths = self.encoder.config.depths  # e.g., [2, 2, 2, 2] for B1
 
-        # 计算每个stage最后一层在hidden_states里的索引
-        # Stage 0: blocks 0,1 → 最后是 index 1
-        # Stage 1: blocks 2,3 → 最后是 index 3
-        # Stage 2: blocks 4,5 → 最后是 index 5
-        # Stage 3: blocks 6,7 → 最后是 index 7
-        stage_indices = []
-        acc = 0
-        for d in depths:
-            acc += d
-            stage_indices.append(acc - 1)  # index 1, 3, 5, 7 for B1
+        # 调试信息（首次运行时打印）
+        if not hasattr(self, '_debug_printed'):
+            print(f"\n[DEBUG] Hidden states info:")
+            print(f"  Number of hidden states: {len(all_hidden)}")
+            print(f"  Depths: {depths}")
+            for i, hs in enumerate(all_hidden):
+                print(f"  hidden_state[{i}] shape: {hs.shape}")
+            self._debug_printed = True
+
+        # SegFormer的hidden_states包含每个stage的输出（共4个）
+        # 直接取最后4个（或者就是4个stage的输出）
+        num_stages = len(depths)
+
+        # 如果hidden_states正好是4个，直接用
+        if len(all_hidden) == num_stages:
+            stage_outputs = all_hidden
+        else:
+            # 否则取每个stage的最后一层
+            stage_indices = []
+            acc = 0
+            for d in depths:
+                acc += d
+                stage_indices.append(acc - 1)
+            stage_outputs = [all_hidden[idx] for idx in stage_indices]
 
         # 计算每个stage的特征图尺寸
         h_sizes = [H // 4, H // 8, H // 16, H // 32]
         w_sizes = [W // 4, W // 8, W // 16, W // 32]
 
-        # 只取4个stage的最后输出，reshape为4D特征图
+        # Reshape为4D特征图
         features = []
-        for i, idx in enumerate(stage_indices):
-            hidden_state = all_hidden[idx]
-
+        for i, hidden_state in enumerate(stage_outputs):
             # 处理不同格式的hidden_state
             if hidden_state.ndim == 3:
                 # (B, N, C) -> (B, C, H, W)
