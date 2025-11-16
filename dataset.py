@@ -1,173 +1,320 @@
 """
-数据加载器 - 【v3.5 最终毕业版】
-- ✅ 采纳顶级GPT建议，修复所有已知BUG和潜在风险
-- ✅ 修复Dataloader调用语法错误
-- ✅ 完善worker_init_fn，确保完全可复现
-- ✅ 增加图像读取断言，提升健壮性
-- ✅ 增加特征dtype兜底，兼容AMP
+LEVIR-CD 变化检测数据集加载器
 """
+import os
+from pathlib import Path
+from typing import Optional, Tuple, List
+
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-import numpy as np
-import cv2
-from pathlib import Path
+from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from packaging import version
 import random
 
 from config import cfg
-from split_dataset import load_split
 
-IGNORE_LABEL = 255
 
-class DistillationDataset(Dataset):
-    def __init__(self, split='train', use_augmentation=True):
+class LEVIRCDDataset(Dataset):
+    """LEVIR-CD变化检测数据集"""
+
+    def __init__(
+        self,
+        root_dir: Path,
+        split: str = 'train',
+        transform: Optional[A.Compose] = None,
+        crop_size: int = 256
+    ):
+        """
+        Args:
+            root_dir: 数据集根目录 (包含train/val/test子目录)
+            split: 数据集划分 ('train', 'val', 'test')
+            transform: albumentations变换
+            crop_size: 裁剪尺寸
+        """
+        self.root_dir = Path(root_dir)
         self.split = split
-        self.use_augmentation = use_augmentation and (split == 'train')
-        self.img_ids = load_split(split)
-        # 几何增强，图像增强，图像归一化张量化掩码转张量
-        self.geo_transform, self.color_transform, self.post_transform = self.get_transforms()
-        print(f"加载 {split} 集: {len(self.img_ids)} 张图像, 数据增强: {self.use_augmentation}")
+        self.transform = transform
+        self.crop_size = crop_size
 
-    def __len__(self):
-        return len(self.img_ids)
+        # 设置路径
+        split_dir = self.root_dir / split
+        self.img_a_dir = split_dir / 'A'
+        self.img_b_dir = split_dir / 'B'
+        self.label_dir = split_dir / 'label'
 
-    def __getitem__(self, idx):
-        img_id = self.img_ids[idx]
+        # 获取所有图像文件名
+        self.img_names = self._get_image_names()
 
-        image = self.load_image(img_id)
-        label = self.load_label(img_id)
-        teacher_feat_b30, teacher_feat_enc = self.load_teacher_features(img_id)
+        print(f"[{split.upper()}] Loaded {len(self.img_names)} image pairs")
 
-        binary_label = np.zeros_like(label, dtype=np.uint8)
-        binary_label[label > 0] = 1  # 所有前景类都变成1
-        binary_label[label == IGNORE_LABEL] = IGNORE_LABEL  # 保持ignore_index
+    def _get_image_names(self) -> List[str]:
+        """获取所有图像文件名"""
+        if not self.img_a_dir.exists():
+            raise FileNotFoundError(f"Directory not found: {self.img_a_dir}")
 
-        # 统一将特征转为(H, W, C)以适配Albumentations
-        feat_b30_hwc = np.transpose(teacher_feat_b30, (1, 2, 0))
-        feat_enc_hwc = np.transpose(teacher_feat_enc, (1, 2, 0))
+        # 获取A目录下所有png文件
+        img_names = sorted([
+            f.stem for f in self.img_a_dir.glob('*.png')
+        ])
 
-        if self.use_augmentation:
-            res = self.geo_transform(image=image, mask=binary_label)  # ✅ 改为binary_label
-            image, binary_label, replay = res['image'], res['mask'], res['replay']  # ✅ 改变量名
+        if len(img_names) == 0:
+            # 尝试jpg格式
+            img_names = sorted([
+                f.stem for f in self.img_a_dir.glob('*.jpg')
+            ])
 
-            # 回放到特征
-            feat_b30_aug_hwc = A.ReplayCompose.replay(replay, image=feat_b30_hwc)['image']
-            feat_enc_aug_hwc = A.ReplayCompose.replay(replay, image=feat_enc_hwc)['image']
+        return img_names
 
-            image = self.color_transform(image=image)['image']
+    def __len__(self) -> int:
+        return len(self.img_names)
 
-            # 将增强后的特征转回 (C, H, W)
-            teacher_feat_b30 = np.transpose(feat_b30_aug_hwc, (2, 0, 1))
-            teacher_feat_enc = np.transpose(feat_enc_aug_hwc, (2, 0, 1))
+    def __getitem__(self, idx: int) -> dict:
+        img_name = self.img_names[idx]
 
-        augmented = self.post_transform(image=image, mask=binary_label)  # ✅ 现在一致了
-        image = augmented['image']
-        binary_label = augmented['mask']  # ✅ 改变量名保持一致
+        # 尝试加载png，如果不存在则尝试jpg
+        img_a_path = self.img_a_dir / f"{img_name}.png"
+        if not img_a_path.exists():
+            img_a_path = self.img_a_dir / f"{img_name}.jpg"
 
-        label = binary_label.squeeze(0).long()  # ✅ 最终返回  # ✅ 修复4: 使用 .copy() 和 astype 确保内存连续性和正确的dtype
-        teacher_feat_b30 = torch.from_numpy(teacher_feat_b30.copy().astype(np.float32)).float()
-        teacher_feat_enc = torch.from_numpy(teacher_feat_enc.copy().astype(np.float32)).float()
+        img_b_path = self.img_b_dir / f"{img_name}.png"
+        if not img_b_path.exists():
+            img_b_path = self.img_b_dir / f"{img_name}.jpg"
+
+        label_path = self.label_dir / f"{img_name}.png"
+        if not label_path.exists():
+            label_path = self.label_dir / f"{img_name}.jpg"
+
+        # 加载图像
+        img_a = np.array(Image.open(img_a_path).convert('RGB'))
+        img_b = np.array(Image.open(img_b_path).convert('RGB'))
+        label = np.array(Image.open(label_path).convert('L'))
+
+        # 将标签二值化 (0: 无变化, 1: 有变化)
+        # LEVIR-CD标签: 白色(255)=变化, 黑色(0)=无变化
+        label = (label > 127).astype(np.uint8)
+
+        # 应用变换
+        if self.transform:
+            # 将两张图像拼接以保证同步变换
+            # albumentations的additional_targets功能
+            transformed = self.transform(
+                image=img_a,
+                image2=img_b,
+                mask=label
+            )
+            img_a = transformed['image']
+            img_b = transformed['image2']
+            label = transformed['mask']
+        else:
+            # 默认转换为tensor
+            img_a = torch.from_numpy(img_a).permute(2, 0, 1).float() / 255.0
+            img_b = torch.from_numpy(img_b).permute(2, 0, 1).float() / 255.0
+            label = torch.from_numpy(label).long()
 
         return {
-            'image': image, 'label': label,
-            'teacher_feat_b30': teacher_feat_b30, 'teacher_feat_enc': teacher_feat_enc,
-            'img_id': img_id
+            'img_a': img_a,
+            'img_b': img_b,
+            'label': label,
+            'name': img_name
         }
 
-    def load_image(self, img_id):
-        img_path = cfg.IMAGE_DIR / f"{img_id}.png"
-        image = cv2.imread(str(img_path))
-        # ✅ 修复2: 增加图像读取断言
-        assert image is not None, f"致命错误: 无法读取图像文件 {img_path}"
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    def load_label(self, img_id):
-        label_path = cfg.LABEL_DIR / f"{img_id}.png"
-        label = cv2.imread(str(label_path), cv2.IMREAD_UNCHANGED)
-        assert label is not None, f"致命错误: 无法读取标签文件 {label_path}"
-        if label.ndim == 3:
-            label = cv2.cvtColor(label, cv2.COLOR_BGR2GRAY)
-        label[label == 65] = IGNORE_LABEL
-        return label.astype(np.uint8)
+def get_train_transforms(crop_size: int = 256) -> A.Compose:
+    """训练集数据增强"""
+    transforms_list = []
 
-    def load_teacher_features(self, img_id):
-        """加载教师特征（如果不存在则返回零特征）"""
-        feat30_path = cfg.FEATURE_BLOCK30_DIR / f"{img_id}.npz"
-        feat_enc_path = cfg.FEATURE_ENCODER_DIR / f"{img_id}.npz"
+    # 随机裁剪（从1024裁剪到256）
+    if cfg.RANDOM_CROP:
+        transforms_list.append(
+            A.RandomCrop(height=crop_size, width=crop_size, p=1.0)
+        )
 
-        # ========== 关键修改：检查文件是否存在 ==========
-        if not feat30_path.exists() or not feat_enc_path.exists():
-            print(f"⚠️  警告：教师特征不存在，返回零特征（img_id={img_id}）")
-            # 返回全零特征
-            feat30 = np.zeros((1280, 64, 64), dtype=np.float32)
-            feat_enc = np.zeros((256, 64, 64), dtype=np.float32)
-            return feat30, feat_enc
-        # ========== 修改结束 ==========
+    # 几何变换
+    if cfg.AUG_HFLIP:
+        transforms_list.append(A.HorizontalFlip(p=cfg.AUG_HFLIP_PROB))
 
-        # 原来的加载逻辑
-        feat30 = np.load(feat30_path)['features'][0]
-        feat_enc = np.load(feat_enc_path)['features'][0]
+    if cfg.AUG_VFLIP:
+        transforms_list.append(A.VerticalFlip(p=cfg.AUG_VFLIP_PROB))
 
-        feat30 = np.transpose(feat30, (2, 0, 1))
+    if cfg.AUG_ROTATE:
+        transforms_list.append(A.RandomRotate90(p=cfg.AUG_ROTATE_PROB))
 
-        return feat30, feat_enc
+    # 颜色变换（对两张图同时应用）
+    if cfg.AUG_COLOR_JITTER:
+        transforms_list.append(
+            A.ColorJitter(
+                brightness=cfg.AUG_BRIGHTNESS,
+                contrast=cfg.AUG_CONTRAST,
+                saturation=cfg.AUG_SATURATION,
+                hue=cfg.AUG_HUE,
+                p=0.5
+            )
+        )
 
-    def get_transforms(self):
-        geo_transforms = [
-            A.HorizontalFlip(p=cfg.AUG_HFLIP_PROB),
-            A.VerticalFlip(p=cfg.AUG_VFLIP_PROB),
-            A.RandomRotate90(p=cfg.AUG_ROTATE_PROB),
-        ]
-        color_transforms = [A.ColorJitter(p=0.5)]
-        post_transforms = [
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2(transpose_mask=True),
-        ]
+    # 高斯噪声
+    if cfg.AUG_GAUSSIAN_NOISE:
+        transforms_list.append(
+            A.GaussNoise(var_limit=cfg.AUG_NOISE_VAR_LIMIT, p=0.3)
+        )
 
-        if self.use_augmentation:
-            return A.ReplayCompose(geo_transforms), A.Compose(color_transforms), A.Compose(post_transforms)
-        else:
-            return A.ReplayCompose([]), A.Compose([]), A.Compose(post_transforms)
+    # 归一化和转换为tensor
+    transforms_list.extend([
+        A.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        ),
+        ToTensorV2()
+    ])
+
+    return A.Compose(
+        transforms_list,
+        additional_targets={'image2': 'image'}  # 确保image2应用相同变换
+    )
+
+
+def get_val_transforms(crop_size: int = 256) -> A.Compose:
+    """验证/测试集数据变换（无增强，只裁剪中心）"""
+    transforms_list = []
+
+    # 中心裁剪
+    if crop_size < cfg.ORIGINAL_SIZE:
+        transforms_list.append(
+            A.CenterCrop(height=crop_size, width=crop_size)
+        )
+
+    # 归一化和转换为tensor
+    transforms_list.extend([
+        A.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        ),
+        ToTensorV2()
+    ])
+
+    return A.Compose(
+        transforms_list,
+        additional_targets={'image2': 'image'}
+    )
+
+
+def get_test_transforms_full() -> A.Compose:
+    """测试集变换（完整1024x1024，用于最终评估）"""
+    return A.Compose(
+        [
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
+            ToTensorV2()
+        ],
+        additional_targets={'image2': 'image'}
+    )
+
 
 def worker_init_fn(worker_id):
-    """✅ 修复3: 完善的随机种子设置"""
+    """确保多进程数据加载的随机性"""
     seed = np.random.get_state()[1][0] + worker_id
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
 
-def build_dataloader(split='train', batch_size=None, num_workers=None, shuffle=None):
-    if batch_size is None: batch_size = cfg.BATCH_SIZE
-    if num_workers is None: num_workers = cfg.NUM_WORKERS
-    if shuffle is None: shuffle = (split == 'train')
 
-    dataset = DistillationDataset(split=split, use_augmentation=(split == 'train'))
+def create_dataloaders(
+    batch_size: int = 8,
+    num_workers: int = 4,
+    crop_size: int = 256
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """创建训练、验证、测试数据加载器"""
 
-    use_persistent = (num_workers > 0) and (version.parse(torch.__version__) >= version.parse("1.8.0"))
-    pin = torch.cuda.is_available() and num_workers > 0
+    # 创建数据集
+    train_dataset = LEVIRCDDataset(
+        root_dir=cfg.DATA_ROOT,
+        split='train',
+        transform=get_train_transforms(crop_size),
+        crop_size=crop_size
+    )
 
-    # ✅ 修复1: 修正Dataloader调用语法
-    dataloader = DataLoader(
-        dataset,
+    val_dataset = LEVIRCDDataset(
+        root_dir=cfg.DATA_ROOT,
+        split='val',
+        transform=get_val_transforms(crop_size),
+        crop_size=crop_size
+    )
+
+    test_dataset = LEVIRCDDataset(
+        root_dir=cfg.DATA_ROOT,
+        split='test',
+        transform=get_val_transforms(crop_size),
+        crop_size=crop_size
+    )
+
+    # 创建数据加载器
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=True,
         num_workers=num_workers,
-        pin_memory=pin,
-        drop_last=(split == 'train'),
-        persistent_workers=use_persistent,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=num_workers > 0,
         worker_init_fn=worker_init_fn
     )
-    return dataloader
 
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=num_workers > 0,
+        worker_init_fn=worker_init_fn
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=num_workers > 0,
+        worker_init_fn=worker_init_fn
+    )
+
+    return train_loader, val_loader, test_loader
 
 
 if __name__ == '__main__':
-    train_loader = build_dataloader('train', batch_size=2)
-    batch = next(iter(train_loader))
-    print(f"  image: {batch['image'].shape} | {batch['image'].dtype}")
-    print(f"  label: {batch['label'].shape} | {batch['label'].dtype}")
-    print(f"  teacher_feat_b30: {batch['teacher_feat_b30'].shape} | {batch['teacher_feat_b30'].dtype}")
-    print(f"  teacher_feat_enc: {batch['teacher_feat_enc'].shape} | {batch['teacher_feat_enc'].dtype}")
-    print(f"  img_id: {batch['img_id']}")
+    # 测试数据加载
+    print("Testing LEVIR-CD Dataset Loading...")
+    cfg.display()
+
+    try:
+        train_loader, val_loader, test_loader = create_dataloaders(
+            batch_size=4,
+            num_workers=0,  # 测试时用0
+            crop_size=256
+        )
+
+        # 测试一个batch
+        batch = next(iter(train_loader))
+        print(f"\nBatch contents:")
+        print(f"  img_a shape: {batch['img_a'].shape}")
+        print(f"  img_b shape: {batch['img_b'].shape}")
+        print(f"  label shape: {batch['label'].shape}")
+        print(f"  label unique values: {torch.unique(batch['label'])}")
+        print(f"  names: {batch['name']}")
+
+        print(f"\nDataset sizes:")
+        print(f"  Train: {len(train_loader.dataset)} samples")
+        print(f"  Val: {len(val_loader.dataset)} samples")
+        print(f"  Test: {len(test_loader.dataset)} samples")
+
+        print("\nDataset loading test passed!")
+
+    except Exception as e:
+        print(f"Error: {e}")
+        print("Make sure LEVIR-CD dataset is placed in data/LEVIR-CD/")

@@ -1,348 +1,282 @@
 """
-损失函数 - 【v2.0 最终毕业版】
-- ✅ 彻底删除KDLoss，聚焦于特征蒸馏
-- ✅ 简化FeatureLoss，只负责计算，不负责对齐
-- ✅ 改造BoundaryLoss，使其适用于二分类任务
-- ✅ 重写TotalLoss，使其与我们的最终方案完全匹配
+变化检测损失函数
+- BCE + Dice组合损失
+- Focal Loss（处理类别不平衡）
+- 边界感知损失
+- 深度监督支持
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from config import cfg
-import logging
-import kornia  # 需要安装: pip install kornia
-logger = logging.getLogger(__name__)
-IGNORE_INDEX = getattr(cfg, 'IGNORE_INDEX', 255)
 
-# ==========================================================
-#                  核心损失函数组件
-# ==========================================================
 
-class ConfidenceWeightedLoss(nn.Module):
-    """
-    置信度加权损失
-
-    对高置信度预测降低权重
-    对低置信度预测增加权重
-    """
-
-    def __init__(self, temperature=2.0):
+class DiceLoss(nn.Module):
+    """Dice损失"""
+    def __init__(self, smooth=1e-6):
         super().__init__()
-        self.temperature = temperature
+        self.smooth = smooth
 
     def forward(self, pred, target):
         """
         Args:
-            pred: (B, 1, H, W) logits
+            pred: (B, C, H, W) logits
             target: (B, H, W) labels
         """
-        # 预测概率
-        pred_prob = torch.sigmoid(pred)  # (B, 1, H, W)
+        num_classes = pred.shape[1]
 
-        # 计算置信度（最大概率）
-        confidence = torch.max(
-            torch.stack([pred_prob, 1 - pred_prob], dim=0),
-            dim=0
-        )[0]  # (B, 1, H, W)
+        if num_classes == 1:
+            # 二分类单通道
+            pred_prob = torch.sigmoid(pred).squeeze(1)
+            target_float = target.float()
+        else:
+            # 多类别
+            pred_prob = F.softmax(pred, dim=1)
+            target_float = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
 
-        # 置信度权重（置信度低的权重高）
-        # weight = exp(-confidence / temperature)
-        weight = torch.exp(-confidence / self.temperature)
+        # 计算Dice
+        if num_classes == 1:
+            intersection = (pred_prob * target_float).sum()
+            union = pred_prob.sum() + target_float.sum()
+            dice = (2 * intersection + self.smooth) / (union + self.smooth)
+        else:
+            # 只计算前景类（类别1）的Dice
+            pred_fg = pred_prob[:, 1]
+            target_fg = target_float[:, 1]
+            intersection = (pred_fg * target_fg).sum()
+            union = pred_fg.sum() + target_fg.sum()
+            dice = (2 * intersection + self.smooth) / (union + self.smooth)
 
-        # BCE损失
-        target_float = target.unsqueeze(1).float()
-        bce = F.binary_cross_entropy_with_logits(
-            pred, target_float, reduction='none'
-        )
-
-        # 加权
-        weighted_bce = bce * weight
-
-        return weighted_bce.mean()
+        return 1 - dice
 
 
-class BoundaryAwareLoss(nn.Module):
-    """
-    边界感知损失
+class FocalLoss(nn.Module):
+    """Focal Loss - 处理类别不平衡"""
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
 
-    使用Sobel算子检测边界，对边界区域增加权重
-    """
+    def forward(self, pred, target):
+        """
+        Args:
+            pred: (B, C, H, W) logits
+            target: (B, H, W) labels
+        """
+        ce_loss = F.cross_entropy(pred, target, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
 
+
+class BoundaryLoss(nn.Module):
+    """边界感知损失"""
     def __init__(self, boundary_weight=2.0):
         super().__init__()
         self.boundary_weight = boundary_weight
 
+        # Sobel算子
+        self.sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+
+        self.sobel_y = torch.tensor([
+            [-1, -2, -1],
+            [0, 0, 0],
+            [1, 2, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+
     def extract_boundary(self, mask):
-        """
-        使用Sobel算子提取边界
+        """提取边界"""
+        device = mask.device
 
-        Args:
-            mask: (B, H, W) 标签mask
+        # 移动Sobel算子到正确设备
+        sobel_x = self.sobel_x.to(device)
+        sobel_y = self.sobel_y.to(device)
 
-        Returns:
-            boundary: (B, 1, H, W) 边界map
-        """
         # 转换为float并添加channel维度
-        mask_float = mask.unsqueeze(1).float()  # (B, 1, H, W)
+        mask_float = mask.unsqueeze(1).float()
 
         # Sobel边缘检测
-        from kornia.filters import sobel
-        edges = sobel(mask_float)  # (B, 1, H, W)
+        edge_x = F.conv2d(mask_float, sobel_x, padding=1)
+        edge_y = F.conv2d(mask_float, sobel_y, padding=1)
+        edges = torch.sqrt(edge_x ** 2 + edge_y ** 2)
 
         # 二值化边界
         boundary = (edges > 0.1).float()
-
         return boundary
 
     def forward(self, pred, target):
         """
-        计算边界感知损失
-
         Args:
-            pred: (B, 1, H, W) 预测logits
-            target: (B, H, W) GT标签
-
-        Returns:
-            loss: scalar
+            pred: (B, C, H, W) logits
+            target: (B, H, W) labels
         """
         # 提取边界
-        boundary = self.extract_boundary(target)  # (B, 1, H, W)
+        boundary = self.extract_boundary(target)
 
-        # 计算BCE损失（逐像素）
-        target_float = target.unsqueeze(1).float()
-        bce = F.binary_cross_entropy_with_logits(
-            pred, target_float, reduction='none'
-        )  # (B, 1, H, W)
+        # 计算CE损失（逐像素）
+        ce_loss = F.cross_entropy(pred, target, reduction='none')
 
         # 边界权重map
-        # 边界区域权重更高，非边界区域权重为1
-        weight_map = 1.0 + self.boundary_weight * boundary
+        weight_map = 1.0 + self.boundary_weight * boundary.squeeze(1)
 
-        # 加权BCE
-        weighted_bce = bce * weight_map
-
-        return weighted_bce.mean()
+        # 加权CE
+        weighted_ce = ce_loss * weight_map
+        return weighted_ce.mean()
 
 
-class DiceLoss(nn.Module):
-    """Dice损失，适用于二分类分割"""
-    def __init__(self, smooth=1e-6):
-        super(DiceLoss, self).__init__()
-        self.smooth = smooth
-
-    def forward(self, pred, target,mask=None):
-        """
-        Args:
-            pred: (B, 1, H, W) - 预测的logits
-            target: (B, H, W) - ground truth (0或1)
-        """
-        pred = torch.sigmoid(pred)
-        if mask is not None:
-            pred = pred * mask
-            target = target * mask
-        # 展平
-        pred_flat = pred.flatten(1)
-        target_flat = target.flatten(1)
-
-        intersection = (pred_flat * target_flat).sum(1)
-        union = pred_flat.sum(1) + target_flat.sum(1)
-        dice = (2 * intersection + self.smooth) / (union + self.smooth)
-        return 1 - dice.mean()
-
-class FeatureLoss(nn.Module):
+class ChangeLoss(nn.Module):
     """
-    【简化版】特征蒸馏损失
-    只负责计算MSE，不负责对齐
+    变化检测组合损失
+
+    支持:
+    - BCE/CE + Dice
+    - Focal Loss
+    - 边界感知
+    - 类别权重
+    - 深度监督
     """
-    def __init__(self):
-        super(FeatureLoss, self).__init__()
-        self.loss_fn = nn.MSELoss()
 
-    def forward(self, student_feat, teacher_feat):
-        """
-        假设输入的特征维度已经对齐
-        """
-        return self.loss_fn(student_feat, teacher_feat)
-
-# ==========================================================
-#                   总损失 (最终方案)
-# ==========================================================
-
-class DistillationLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        self.bce_loss  = nn.BCEWithLogitsLoss()
+
         self.dice_loss = DiceLoss()
-        self.feat_loss = FeatureLoss()
+        self.focal_loss = FocalLoss(alpha=cfg.FOCAL_ALPHA, gamma=cfg.FOCAL_GAMMA)
+        self.boundary_loss = BoundaryLoss(boundary_weight=2.0)
 
-        # ✅ 正确
-        self.w_seg = getattr(cfg, 'LOSS_SEG_WEIGHT', 1.0)
-        self.w_feat_b30 = getattr(cfg, 'LOSS_FEAT_B30_WEIGHT', 0.5)
-        self.w_feat_enc = getattr(cfg, 'LOSS_FEAT_ENC_WEIGHT', 0.5)
+        # 类别权重
+        if cfg.USE_CLASS_WEIGHTS:
+            self.class_weights = torch.tensor(cfg.CLASS_WEIGHTS, dtype=torch.float32)
+        else:
+            self.class_weights = None
 
-    def forward(self, outputs, targets):
-        pred      = outputs['pred']                  # (B,1,H,W)
+        # 损失权重
+        self.w_bce = cfg.LOSS_WEIGHT_BCE
+        self.w_dice = cfg.LOSS_WEIGHT_DICE
+        self.w_boundary = cfg.LOSS_WEIGHT_BOUNDARY
+
+        # 深度监督权重
+        if cfg.DEEP_SUPERVISION:
+            self.ds_weights = cfg.DEEP_SUPERVISION_WEIGHTS
+        else:
+            self.ds_weights = None
+
+    def compute_loss(self, pred, target):
+        """计算单个预测的损失"""
         device = pred.device
-        gt_label = targets['label'].to(pred.device)  # ✅ 现在拿到的gt_label直接就是二值的了！              # (B,H,W)
-        mask      = (gt_label != IGNORE_INDEX).to(pred.device)   # bool
-        gt_binary = gt_label.float()  # ✅ 不再需要 (gt_label > 0) 的转换！
 
-        # 1. Seg Loss
-        mask_4d   = mask.unsqueeze(1).float()        # (B,1,H,W)
-        loss_dice = self.dice_loss(pred, gt_binary.unsqueeze(1), mask_4d)
+        # 移动类别权重到正确设备
+        if self.class_weights is not None:
+            weight = self.class_weights.to(device)
+        else:
+            weight = None
 
-        valid = mask.bool()
-        loss_bce = F.binary_cross_entropy_with_logits(
-            pred.squeeze(1)[valid],
-            gt_binary[valid],
-            reduction='mean'
-        )
-        pos_weight = getattr(cfg, 'BCE_POS_WEIGHT', None)
-        if pos_weight is not None:
-            self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
-            loss_bce = self.bce_loss(pred.squeeze(1)[valid], gt_binary[valid])
+        # BCE/CE损失
+        if cfg.LOSS_TYPE == "focal":
+            loss_ce = self.focal_loss(pred, target)
+        else:
+            loss_ce = F.cross_entropy(pred, target, weight=weight, ignore_index=cfg.IGNORE_INDEX)
 
-        loss_seg  = loss_bce + loss_dice
+        # Dice损失
+        loss_dice = self.dice_loss(pred, target)
 
-        # 2. Feature KD
-        t_feat_b30 = targets['teacher_feat_b30'].to(device).detach()
-        t_feat_enc = targets['teacher_feat_enc'].to(device).detach()
-        loss_feat_b30 = self.feat_loss(outputs['feat_b30'], t_feat_b30.detach())
-        loss_feat_enc = self.feat_loss(outputs['feat_enc'], t_feat_enc.detach())
+        # 边界损失
+        if self.w_boundary > 0:
+            loss_boundary = self.boundary_loss(pred, target)
+        else:
+            loss_boundary = torch.tensor(0.0, device=device)
 
-        # 3. Total
-        total_loss = (self.w_seg * loss_seg +
-                      self.w_feat_b30 * loss_feat_b30 +
-                      self.w_feat_enc * loss_feat_enc)
+        # 组合
+        total = self.w_bce * loss_ce + self.w_dice * loss_dice + self.w_boundary * loss_boundary
 
-        with torch.no_grad():
-            loss_dict = {
-                'total': total_loss.item(),
-                'seg': loss_seg.item(),
-                'bce': loss_bce.item(),
-                'dice': loss_dice.item(),
-                'feat_b30': loss_feat_b30.item(),
-                'feat_enc': loss_feat_enc.item()
-            }
-        return total_loss, loss_dict
-
-
-class DistillationLossWithTricks(nn.Module):
-    """
-    蒸馏损失 + 边界感知
-    组合你现有的蒸馏损失和新的边界感知
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        self.bce_loss = nn.BCEWithLogitsLoss()
-        self.dice_loss = DiceLoss()
-        self.boundary_loss = BoundaryAwareLoss(boundary_weight=2.0)
-        self.confidence_loss = ConfidenceWeightedLoss(temperature=2.0)  # 新增
-        self.mse_loss = nn.MSELoss()
+        return total, {
+            'ce': loss_ce.item(),
+            'dice': loss_dice.item(),
+            'boundary': loss_boundary.item()
+        }
 
     def forward(self, outputs, targets):
         """
         Args:
             outputs: {
-                'pred': (B, 1, H, W),
-                'feat_b30': (B, C1, H1, W1),
-                'feat_enc': (B, C2, H2, W2)
+                'pred': (B, C, H, W) 主预测
+                'aux_preds': [(B, C, H, W), ...] 辅助预测（深度监督）
             }
-            targets: {
-                'label': (B, H, W),
-                'teacher_feat_b30': (B, C1, H1, W1),
-                'teacher_feat_enc': (B, C2, H2, W2)
-            }
+            targets: (B, H, W) 标签
+
+        Returns:
+            total_loss: 总损失
+            loss_dict: 各项损失详情
         """
         pred = outputs['pred']
-        label = targets['label']
+        label = targets
 
-        # ========== 分割损失 ==========
-        # 原来的BCE
-        loss_bce = self.bce_loss(
-            pred,
-            label.unsqueeze(1).float()
-        )
+        # 主损失
+        main_loss, loss_dict = self.compute_loss(pred, label)
 
-        # 原来的Dice
-        loss_dice = self.dice_loss(
-            torch.sigmoid(pred),
-            label.unsqueeze(1).float()
-        )
+        total_loss = main_loss
+        loss_dict['main'] = main_loss.item()
 
-        # 新增：边界感知
-        loss_boundary = self.boundary_loss(pred, label)
+        # 深度监督损失
+        if self.training and 'aux_preds' in outputs and self.ds_weights is not None:
+            aux_losses = []
+            for i, aux_pred in enumerate(outputs['aux_preds']):
+                aux_loss, _ = self.compute_loss(aux_pred, label)
+                aux_losses.append(aux_loss * self.ds_weights[i])
+                loss_dict[f'aux_{i}'] = aux_loss.item()
 
-        # ========== 特征蒸馏损失（不变）==========
-        loss_feat_b30 = self.mse_loss(
-            outputs['feat_b30'],
-            targets['teacher_feat_b30']
-        )
+            ds_loss = sum(aux_losses)
+            total_loss = total_loss + ds_loss
+            loss_dict['deep_supervision'] = ds_loss.item()
 
-        loss_feat_enc = self.mse_loss(
-            outputs['feat_enc'],
-            targets['teacher_feat_enc']
-        )
-        loss_confidence = self.confidence_loss(pred, label)
-        # ========== 总损失 ==========
-        # 组合所有损失
-        from config import cfg
+        loss_dict['total'] = total_loss.item()
 
-        total_loss = (
-                cfg.LOSS_WEIGHT_SEG * (loss_bce + loss_dice) +
-                cfg.LOSS_WEIGHT_BOUNDARY * loss_boundary +
-                cfg.LOSS_WEIGHT_CONFIDENCE * loss_confidence +  # 新增
-                cfg.LOSS_WEIGHT_FEAT_B30 * loss_feat_b30 +
-                cfg.LOSS_WEIGHT_FEAT_ENC * loss_feat_enc
-        )
+        return total_loss, loss_dict
 
-        return total_loss, {
-            'seg': (loss_bce + loss_dice).item(),
-            'boundary': loss_boundary.item(),
-            'confidence': loss_confidence.item(),  # 新增
-            'feat_b30': loss_feat_b30.item(),
-            'feat_enc': loss_feat_enc.item()
-        }
+
+def build_criterion():
+    """构建损失函数"""
+    return ChangeLoss()
+
 
 if __name__ == '__main__':
-    """测试最终的DistillationLoss"""
+    """测试损失函数"""
     print("=" * 60)
-    print("测试最终版DistillationLoss")
+    print("Testing Change Detection Loss")
     print("=" * 60)
 
-    # 虚拟数据 (新增 ignore 测试)
+    # 虚拟数据
     B, H, W = 2, 256, 256
-    h, w = 64, 64
 
-    # 学生输出
+    # 模型输出
     outputs = {
-        'pred': torch.randn(B, 1, H, W),
-        'feat_b30': torch.randn(B, 1280, h, w),
-        'feat_enc': torch.randn(B, 256, h, w)
+        'pred': torch.randn(B, 2, H, W),  # 2类输出
+        'aux_preds': [
+            torch.randn(B, 2, H, W),
+            torch.randn(B, 2, H, W),
+            torch.randn(B, 2, H, W),
+            torch.randn(B, 2, H, W)
+        ]
     }
 
-    # 监督信号 (新增 255 ignore 区域)
-    # 先生成二值，再打一些 ignore
-    label = torch.randint(0, 2, (B, H, W))  # {0,1}
-    ignore_mask = torch.rand(B, H, W) < 0.1  # 10% 像素忽略（示例）
-    label[ignore_mask] = IGNORE_INDEX  # 255
+    # 标签
+    targets = torch.randint(0, 2, (B, H, W))
 
-    targets = {
-        'label': label,
-        'teacher_feat_b30': torch.randn(B, 1280, h, w),
-        'teacher_feat_enc': torch.randn(B, 256, h, w)
-    }
+    # 创建损失函数
+    criterion = ChangeLoss()
+    criterion.train()
 
-    loss_fn = DistillationLoss()
-    total_loss, loss_dict = loss_fn(outputs, targets)
+    # 计算损失
+    total_loss, loss_dict = criterion(outputs, targets)
 
     print(f"Total Loss: {total_loss.item():.4f}")
-    print(f"Loss Dict: {loss_dict}")
-
-    assert 'seg' in loss_dict and 'feat_b30' in loss_dict and 'feat_enc' in loss_dict
+    print(f"\nLoss Details:")
+    for k, v in loss_dict.items():
+        print(f"  {k}: {v:.4f}")
 
     print("\n" + "=" * 60)
-    print("✓ 最终版损失函数测试通过")
+    print("Loss function test passed!")
     print("=" * 60)
