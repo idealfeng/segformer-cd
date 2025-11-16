@@ -198,18 +198,21 @@ class SegFormerCD(nn.Module):
         )
 
         # 获取所有hidden states
-        # hidden_states = [embedding输出] + [每层Transformer block输出]
-        # 例如B1的depths=[2,2,2,2]，hidden_states长度=1+2+2+2+2=9
+        # hidden_states 是每个encoder block的输出（不含embedding）
+        # 例如B1的depths=[2,2,2,2]，hidden_states长度=2+2+2+2=8
         all_hidden = outputs.hidden_states
         depths = self.encoder.config.depths  # e.g., [2, 2, 2, 2] for B1
 
         # 计算每个stage最后一层在hidden_states里的索引
-        # 跳过index 0（embedding输出），取每个stage的最后一层
+        # Stage 0: blocks 0,1 → 最后是 index 1
+        # Stage 1: blocks 2,3 → 最后是 index 3
+        # Stage 2: blocks 4,5 → 最后是 index 5
+        # Stage 3: blocks 6,7 → 最后是 index 7
         stage_indices = []
         acc = 0
         for d in depths:
             acc += d
-            stage_indices.append(acc)  # index 2, 4, 6, 8 for B1
+            stage_indices.append(acc - 1)  # index 1, 3, 5, 7 for B1
 
         # 计算每个stage的特征图尺寸
         h_sizes = [H // 4, H // 8, H // 16, H // 32]
