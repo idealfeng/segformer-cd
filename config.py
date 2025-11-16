@@ -36,8 +36,8 @@ class Config:
     # 训练图像尺寸（裁剪后）
     IMAGE_SIZE = 256
 
-    # 类别数（二分类：无变化/有变化）
-    NUM_CLASSES = 2
+    # 类别数（二值变化检测：1通道输出，用Sigmoid）
+    NUM_CLASSES = 1
 
     # Ignore标签
     IGNORE_INDEX = 255

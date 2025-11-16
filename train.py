@@ -42,10 +42,11 @@ def set_seed(seed):
         torch.backends.cudnn.benchmark = False
 
 
-def compute_metrics(pred, target):
-    """计算评估指标"""
-    # 获取预测类别
-    pred_class = pred.argmax(dim=1)  # (B, H, W)
+def compute_metrics(pred, target, threshold=0.5):
+    """计算评估指标（二值版本）"""
+    # 获取预测类别：sigmoid + threshold
+    pred_prob = torch.sigmoid(pred.squeeze(1))  # (B, H, W)
+    pred_class = (pred_prob > threshold).long()  # (B, H, W)
 
     # 计算TP, FP, FN, TN (只针对前景类/变化类)
     tp = ((pred_class == 1) & (target == 1)).sum().float()

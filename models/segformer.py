@@ -164,25 +164,27 @@ class SegFormerCD(nn.Module):
         else:
             self.aux_heads = None
 
-        self._init_weights()
+        # 只初始化新增模块，不要动预训练的encoder！
+        self.diff_modules.apply(self._init_weights)
+        self.decoder.apply(self._init_weights)
+        self.classifier.apply(self._init_weights)
+        if self.aux_heads is not None:
+            self.aux_heads.apply(self._init_weights)
 
         print(f"Model built successfully!")
         print(f"  Encoder channels: {self.channels}")
         print(f"  Deep supervision: {cfg.DEEP_SUPERVISION}")
         print(f"  Output classes: {num_classes}")
 
-    def _init_weights(self):
-        """初始化新增层的权重"""
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                if m.weight.requires_grad:
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                if m.weight.requires_grad:
-                    nn.init.constant_(m.weight, 1)
-                    nn.init.constant_(m.bias, 0)
+    def _init_weights(self, m):
+        """初始化新增层的权重（只对新模块调用）"""
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
 
     def _extract_features(self, x):
         """提取多尺度特征"""
@@ -195,25 +197,33 @@ class SegFormerCD(nn.Module):
             return_dict=True
         )
 
-        # 获取所有stage的特征
-        hidden_states = outputs.hidden_states
+        # 获取所有hidden states
+        # hidden_states = [embedding输出] + [每层Transformer block输出]
+        # 例如B1的depths=[2,2,2,2]，hidden_states长度=1+2+2+2+2=9
+        all_hidden = outputs.hidden_states
+        depths = self.encoder.config.depths  # e.g., [2, 2, 2, 2] for B1
+
+        # 计算每个stage最后一层在hidden_states里的索引
+        # 跳过index 0（embedding输出），取每个stage的最后一层
+        stage_indices = []
+        acc = 0
+        for d in depths:
+            acc += d
+            stage_indices.append(acc)  # index 2, 4, 6, 8 for B1
 
         # 计算每个stage的特征图尺寸
         h_sizes = [H // 4, H // 8, H // 16, H // 32]
         w_sizes = [W // 4, W // 8, W // 16, W // 32]
 
-        # Reshape为4D特征图
+        # 只取4个stage的最后输出，reshape为4D特征图
         features = []
-        for i, hidden_state in enumerate(hidden_states):
-            if hidden_state.ndim == 3:
-                # (B, N, C) -> (B, C, H, W)
-                B, N, C = hidden_state.shape
-                feat = hidden_state.permute(0, 2, 1).reshape(B, C, h_sizes[i], w_sizes[i])
-            else:
-                feat = hidden_state
+        for i, idx in enumerate(stage_indices):
+            hidden_state = all_hidden[idx]  # (B, N, C)
+            B_, N, C_ = hidden_state.shape
+            feat = hidden_state.permute(0, 2, 1).reshape(B_, C_, h_sizes[i], w_sizes[i])
             features.append(feat)
 
-        return features
+        return features  # 长度4，对应4个尺度
 
     def forward(self, img_a, img_b):
         """
@@ -309,8 +319,8 @@ if __name__ == '__main__':
     original_ds = cfg.DEEP_SUPERVISION
     cfg.DEEP_SUPERVISION = True
 
-    # 创建模型
-    model = build_model(variant='b1', pretrained=True, num_classes=2)
+    # 创建模型（二值变化检测用1通道输出）
+    model = build_model(variant='b1', pretrained=True, num_classes=1)
 
     # 测试前向传播
     print("\nTesting forward pass...")
@@ -335,8 +345,8 @@ if __name__ == '__main__':
         for i, aux in enumerate(outputs['aux_preds']):
             print(f"  aux_pred_{i}: {aux.shape}")
 
-    # 验证输出
-    assert outputs['pred'].shape == (2, 2, 256, 256)
+    # 验证输出（1通道二值变化检测）
+    assert outputs['pred'].shape == (2, 1, 256, 256), f"Expected (2,1,256,256), got {outputs['pred'].shape}"
     print("\n" + "=" * 60)
     print("Model test passed!")
     print("=" * 60)

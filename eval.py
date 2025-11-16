@@ -105,7 +105,9 @@ class Evaluator:
 
             # 前向传播
             outputs = self.model(img_a, img_b)
-            pred = outputs['pred'].argmax(dim=1)  # (B, H, W)
+            # 二值预测：sigmoid + threshold
+            pred_prob = torch.sigmoid(outputs['pred'].squeeze(1))  # (B, H, W)
+            pred = (pred_prob > 0.5).long()  # (B, H, W)
 
             # 累积混淆矩阵
             tp = ((pred == 1) & (label == 1)).sum().item()
@@ -221,7 +223,9 @@ class Evaluator:
             names = batch['name']
 
             outputs = self.model(img_a, img_b)
-            pred = outputs['pred'].argmax(dim=1)
+            # 二值预测：sigmoid + threshold
+            pred_prob = torch.sigmoid(outputs['pred'].squeeze(1))
+            pred = (pred_prob > 0.5).long()
 
             # 保存每个样本
             for i in range(min(len(names), num_samples - count)):
