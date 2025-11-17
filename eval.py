@@ -96,11 +96,66 @@ class Evaluator:
         print(f"  Total parameters: {total_params / 1e6:.2f}M")
         print(f"  Trainable parameters: {trainable_params / 1e6:.2f}M")
 
+    def sliding_window_inference(self, img_a, img_b, window_size=256, stride=256):
+        """
+        滑动窗口推理，处理大尺寸图像
+
+        Args:
+            img_a: (1, 3, H, W)
+            img_b: (1, 3, H, W)
+            window_size: 窗口大小（与训练尺寸一致）
+            stride: 滑动步长（stride < window_size 会有重叠）
+
+        Returns:
+            pred_prob: (1, H, W) 概率图
+        """
+        _, _, H, W = img_a.shape
+
+        # 如果图像尺寸小于等于窗口，直接推理
+        if H <= window_size and W <= window_size:
+            outputs = self.model(img_a, img_b)
+            return torch.sigmoid(outputs['pred'].squeeze(1))
+
+        # 初始化输出和计数器（用于重叠区域平均）
+        pred_sum = torch.zeros((1, H, W), device=self.device)
+        count_map = torch.zeros((1, H, W), device=self.device)
+
+        # 滑动窗口
+        for y in range(0, H, stride):
+            for x in range(0, W, stride):
+                # 计算窗口边界
+                y_end = min(y + window_size, H)
+                x_end = min(x + window_size, W)
+                y_start = y_end - window_size
+                x_start = x_end - window_size
+
+                # 确保不越界
+                y_start = max(0, y_start)
+                x_start = max(0, x_start)
+
+                # 提取patch
+                patch_a = img_a[:, :, y_start:y_end, x_start:x_end]
+                patch_b = img_b[:, :, y_start:y_end, x_start:x_end]
+
+                # 推理
+                outputs = self.model(patch_a, patch_b)
+                patch_pred = torch.sigmoid(outputs['pred'].squeeze(1))  # (1, h, w)
+
+                # 累加到输出
+                pred_sum[:, y_start:y_end, x_start:x_end] += patch_pred
+                count_map[:, y_start:y_end, x_start:x_end] += 1
+
+        # 平均（处理重叠区域）
+        pred_prob = pred_sum / count_map.clamp(min=1)
+
+        return pred_prob
+
     @torch.no_grad()
     def evaluate(self):
         """评估模型性能"""
         print("\n" + "=" * 60)
         print("Evaluating on test set...")
+        print(f"Using sliding window inference (window={cfg.IMAGE_SIZE}, stride={cfg.IMAGE_SIZE})")
         print("=" * 60)
 
         # 累积统计量
@@ -116,11 +171,13 @@ class Evaluator:
             img_b = batch['img_b'].to(self.device)
             label = batch['label'].to(self.device).long()
 
-            # 前向传播
-            outputs = self.model(img_a, img_b)
-            # 二值预测：sigmoid + threshold
-            pred_prob = torch.sigmoid(outputs['pred'].squeeze(1))  # (B, H, W)
-            pred = (pred_prob > 0.5).long()  # (B, H, W)
+            # 滑动窗口推理
+            pred_prob = self.sliding_window_inference(
+                img_a, img_b,
+                window_size=cfg.IMAGE_SIZE,  # 256
+                stride=cfg.IMAGE_SIZE  # 无重叠，可改为128有重叠
+            )
+            pred = (pred_prob > 0.5).long().squeeze(0)  # (H, W)
 
             # 累积混淆矩阵
             tp = ((pred == 1) & (label == 1)).sum().item()
@@ -235,38 +292,38 @@ class Evaluator:
             label = batch['label'].to(self.device).long()
             names = batch['name']
 
-            outputs = self.model(img_a, img_b)
-            # 二值预测：sigmoid + threshold
-            pred_prob = torch.sigmoid(outputs['pred'].squeeze(1))
-            pred = (pred_prob > 0.5).long()
+            # 使用滑动窗口推理
+            pred_prob = self.sliding_window_inference(
+                img_a, img_b,
+                window_size=cfg.IMAGE_SIZE,
+                stride=cfg.IMAGE_SIZE
+            )
+            pred = (pred_prob > 0.5).long().squeeze(0)  # (H, W)
 
-            # 保存每个样本
-            for i in range(min(len(names), num_samples - count)):
-                name = names[i]
+            # 保存每个样本（batch_size=1）
+            name = names[0]
 
-                # 转换为numpy
-                pred_np = pred[i].cpu().numpy().astype(np.uint8) * 255
-                label_np = label[i].cpu().numpy().astype(np.uint8) * 255
+            # 转换为numpy
+            pred_np = pred.cpu().numpy().astype(np.uint8) * 255
+            label_np = label[0].cpu().numpy().astype(np.uint8) * 255
 
-                # 保存预测和GT
-                pred_img = Image.fromarray(pred_np)
-                label_img = Image.fromarray(label_np)
+            # 保存预测和GT
+            pred_img = Image.fromarray(pred_np)
+            label_img = Image.fromarray(label_np)
 
-                pred_img.save(save_dir / f'{name}_pred.png')
-                label_img.save(save_dir / f'{name}_gt.png')
+            pred_img.save(save_dir / f'{name}_pred.png')
+            label_img.save(save_dir / f'{name}_gt.png')
 
-                # 计算误差图（红色：FP，蓝色：FN）
-                error_map = np.zeros((pred_np.shape[0], pred_np.shape[1], 3), dtype=np.uint8)
-                error_map[(pred_np > 0) & (label_np == 0)] = [255, 0, 0]  # FP: 红色
-                error_map[(pred_np == 0) & (label_np > 0)] = [0, 0, 255]  # FN: 蓝色
-                error_map[(pred_np > 0) & (label_np > 0)] = [0, 255, 0]   # TP: 绿色
+            # 计算误差图（红色：FP，蓝色：FN）
+            error_map = np.zeros((pred_np.shape[0], pred_np.shape[1], 3), dtype=np.uint8)
+            error_map[(pred_np > 0) & (label_np == 0)] = [255, 0, 0]  # FP: 红色
+            error_map[(pred_np == 0) & (label_np > 0)] = [0, 0, 255]  # FN: 蓝色
+            error_map[(pred_np > 0) & (label_np > 0)] = [0, 255, 0]   # TP: 绿色
 
-                error_img = Image.fromarray(error_map)
-                error_img.save(save_dir / f'{name}_error.png')
+            error_img = Image.fromarray(error_map)
+            error_img.save(save_dir / f'{name}_error.png')
 
-                count += 1
-                if count >= num_samples:
-                    break
+            count += 1
 
         print(f"Saved {count} visualizations")
 
