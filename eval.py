@@ -14,6 +14,7 @@ from pathlib import Path
 import json
 import time
 from PIL import Image
+from torch.utils.data import DataLoader
 
 from config import cfg
 from dataset import create_dataloaders
@@ -67,10 +68,22 @@ class Evaluator:
 
     def build_test_loader(self):
         """构建测试数据加载器"""
-        _, _, test_loader = create_dataloaders(
-            batch_size=self.batch_size,
+        from dataset import LEVIRCDDataset, get_test_transforms_full
+
+        # 测试集用完整1024x1024图像，不裁剪
+        test_dataset = LEVIRCDDataset(
+            root_dir=cfg.DATA_ROOT,
+            split='test',
+            transform=get_test_transforms_full(),  # 只归一化，不裁剪
+            crop_size=cfg.ORIGINAL_SIZE  # 1024
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,  # 1024x1024图像用batch_size=1避免OOM
+            shuffle=False,
             num_workers=cfg.NUM_WORKERS,
-            crop_size=cfg.CROP_SIZE
+            pin_memory=False
         )
         return test_loader
 
