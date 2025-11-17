@@ -35,6 +35,56 @@ class ChannelAttention(nn.Module):
         return x * attention
 
 
+class TemporalExchangeModule(nn.Module):
+    """
+    跨时序特征交换模块 (Temporal Feature Exchange)
+
+    核心思想：交换两时相特征的部分通道，使得：
+    - 每个时相特征都包含对方的语义信息（语义引导）
+    - 同时保留自身的空间信息（空间定位）
+
+    参考：EDED架构 (IEEE TGRS 2023)
+    """
+    def __init__(self, channels, exchange_ratio=0.5):
+        super().__init__()
+        self.exchange_ratio = exchange_ratio
+        self.split_channels = int(channels * exchange_ratio)
+
+        # 交换后的特征融合（学习最优组合权重）
+        self.fusion_a = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        self.fusion_b = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, feat_a, feat_b):
+        """
+        Args:
+            feat_a: 时刻A特征 (B, C, H, W)
+            feat_b: 时刻B特征 (B, C, H, W)
+        Returns:
+            exchanged_a: 包含B语义的A特征
+            exchanged_b: 包含A语义的B特征
+        """
+        # 通道交换：前half来自对方，后half保留自己
+        split = self.split_channels
+
+        # A的前半部分换成B的，B的前半部分换成A的
+        exchanged_a = torch.cat([feat_b[:, :split], feat_a[:, split:]], dim=1)
+        exchanged_b = torch.cat([feat_a[:, :split], feat_b[:, split:]], dim=1)
+
+        # 融合交换后的特征
+        exchanged_a = self.fusion_a(exchanged_a)
+        exchanged_b = self.fusion_b(exchanged_b)
+
+        return exchanged_a, exchanged_b
+
+
 class DifferenceModule(nn.Module):
     """差异计算模块"""
     def __init__(self, in_channels, out_channels):
@@ -145,6 +195,17 @@ class SegFormerCD(nn.Module):
         # 获取各stage通道数
         self.channels = self.encoder.config.hidden_sizes  # e.g., [64, 128, 320, 512] for B1
 
+        # 跨时序特征交换模块（语义引导）
+        self.use_temporal_exchange = getattr(cfg, 'USE_TEMPORAL_EXCHANGE', True)
+        if self.use_temporal_exchange:
+            self.exchange_modules = nn.ModuleList([
+                TemporalExchangeModule(ch, exchange_ratio=0.5) for ch in self.channels
+            ])
+            print(f"  Temporal exchange: Enabled (ratio=0.5)")
+        else:
+            self.exchange_modules = None
+            print(f"  Temporal exchange: Disabled")
+
         # 多尺度差异模块
         self.diff_modules = nn.ModuleList([
             DifferenceModule(ch, ch) for ch in self.channels
@@ -165,6 +226,8 @@ class SegFormerCD(nn.Module):
             self.aux_heads = None
 
         # 只初始化新增模块，不要动预训练的encoder！
+        if self.exchange_modules is not None:
+            self.exchange_modules.apply(self._init_weights)
         self.diff_modules.apply(self._init_weights)
         self.decoder.apply(self._init_weights)
         self.classifier.apply(self._init_weights)
@@ -268,6 +331,17 @@ class SegFormerCD(nn.Module):
         # 提取两个时刻的特征
         feats_a = self._extract_features(img_a)
         feats_b = self._extract_features(img_b)
+
+        # 跨时序特征交换（语义引导）
+        if self.exchange_modules is not None:
+            exchanged_a = []
+            exchanged_b = []
+            for i in range(len(self.channels)):
+                exc_a, exc_b = self.exchange_modules[i](feats_a[i], feats_b[i])
+                exchanged_a.append(exc_a)
+                exchanged_b.append(exc_b)
+            feats_a = exchanged_a
+            feats_b = exchanged_b
 
         # 计算多尺度差异特征
         diff_feats = []

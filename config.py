@@ -63,6 +63,10 @@ class Config:
     DEEP_SUPERVISION = True
     DEEP_SUPERVISION_WEIGHTS = [1.0, 0.4, 0.2, 0.1]  # 各尺度权重
 
+    # 跨时序特征交换（语义引导模块）
+    USE_TEMPORAL_EXCHANGE = True
+    EXCHANGE_RATIO = 0.5  # 交换通道比例
+
     # ==================== 训练配置 ====================
     # 基础训练参数
     BATCH_SIZE = 8  # 4060 8G显存，256x256图像
