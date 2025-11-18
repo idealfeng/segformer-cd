@@ -35,41 +35,31 @@ class ChannelAttention(nn.Module):
         return x * attention
 
 
-class TemporalExchangeModule(nn.Module):
+class SemanticGuidanceModule(nn.Module):
     """
-    跨时序特征交换模块 (Temporal Feature Exchange) - 改进版
+    语义引导模块 - 生成变化区域置信图
 
-    核心改进：
-    1. 残差连接：feat + gate * other_feat (保证下界)
-    2. 通道门控：每个通道自适应学习交换强度
-    3. 只在高层使用：语义特征更适合交换
+    核心思想（正交设计）：
+    1. 不改变原始特征，保持差异计算纯净
+    2. 融合双时相语义特征，生成"哪里可能变化"的置信图
+    3. 用置信图去调制差异特征的响应
 
-    参考：EDED架构 (IEEE TGRS 2023) + 门控机制
+    这才是真正的"语义引导 + 空间定位"：
+    - 语义融合 → 确定大致变化区域（guide mask）
+    - 空间差异 → 精确定位变化地物（|Fa - Fb|）
     """
-    def __init__(self, channels, use_gate=True):
+    def __init__(self, channels):
         super().__init__()
-        self.use_gate = use_gate
-
-        if use_gate:
-            # 通道门控：学习每个通道的交换强度
-            self.channel_gate = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Conv2d(channels * 2, channels // 4, 1, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(channels // 4, channels, 1, bias=False),
-                nn.Sigmoid()  # 输出0-1，控制交换强度
-            )
-
-        # 交换后的特征细化
-        self.refine_a = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+        # 语义融合网络：产生变化置信图
+        self.guidance_net = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-        self.refine_b = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 2, 1, 1),  # 输出1通道置信图
+            nn.Sigmoid()  # (0, 1) 表示变化概率
         )
 
     def forward(self, feat_a, feat_b):
@@ -78,31 +68,21 @@ class TemporalExchangeModule(nn.Module):
             feat_a: 时刻A特征 (B, C, H, W)
             feat_b: 时刻B特征 (B, C, H, W)
         Returns:
-            exchanged_a: 包含B语义的A特征
-            exchanged_b: 包含A语义的B特征
+            guide: 变化置信图 (B, 1, H, W) ∈ (0, 1)
         """
-        if self.use_gate:
-            # 通道门控：自适应决定交换强度
-            concat = torch.cat([feat_a, feat_b], dim=1)
-            gate = self.channel_gate(concat)  # (B, C, 1, 1)
-
-            # 残差式交换：原特征 + 门控 * 对方特征
-            exchanged_a = feat_a + gate * feat_b
-            exchanged_b = feat_b + gate * feat_a
-        else:
-            # 简单残差：直接加权融合
-            exchanged_a = feat_a + 0.5 * feat_b
-            exchanged_b = feat_b + 0.5 * feat_a
-
-        # 细化交换后的特征
-        exchanged_a = self.refine_a(exchanged_a)
-        exchanged_b = self.refine_b(exchanged_b)
-
-        return exchanged_a, exchanged_b
+        # 拼接双时相语义特征
+        concat = torch.cat([feat_a, feat_b], dim=1)
+        # 生成变化置信图
+        guide = self.guidance_net(concat)  # (B, 1, H, W)
+        return guide
 
 
 class DifferenceModule(nn.Module):
-    """差异计算模块"""
+    """
+    差异计算模块（支持语义引导）
+
+    改进：接受可选的guide mask来调制差异响应
+    """
     def __init__(self, in_channels, out_channels):
         super().__init__()
         # 差异特征融合
@@ -117,14 +97,29 @@ class DifferenceModule(nn.Module):
         # 通道注意力
         self.ca = ChannelAttention(out_channels)
 
-    def forward(self, feat_a, feat_b):
-        # 计算差异特征
+    def forward(self, feat_a, feat_b, guide=None):
+        """
+        Args:
+            feat_a: 时刻A特征 (B, C, H, W)
+            feat_b: 时刻B特征 (B, C, H, W)
+            guide: 语义引导置信图 (B, 1, H, W) [可选]
+        Returns:
+            out: 差异特征 (B, C, H, W)
+        """
+        # 计算差异特征（保持纯净，不被语义交换污染）
         diff = torch.abs(feat_a - feat_b)
         # 拼接原始特征和差异特征
         concat = torch.cat([diff, feat_a + feat_b], dim=1)
         # 融合
         out = self.conv(concat)
-        # 注意力增强
+
+        # 语义引导：用置信图调制差异响应
+        if guide is not None:
+            # guide ∈ (0,1) 表示"该位置变化的概率"
+            # 高置信区域的差异特征被增强，低置信区域被抑制
+            out = out * guide
+
+        # 通道注意力增强
         out = self.ca(out)
         return out
 
@@ -211,29 +206,29 @@ class SegFormerCD(nn.Module):
         # 获取各stage通道数
         self.channels = self.encoder.config.hidden_sizes  # e.g., [64, 128, 320, 512] for B1
 
-        # 跨时序特征交换模块（语义引导，仅高层）
-        self.use_temporal_exchange = getattr(cfg, 'USE_TEMPORAL_EXCHANGE', True)
-        self.exchange_high_level_only = getattr(cfg, 'EXCHANGE_HIGH_LEVEL_ONLY', True)
+        # 语义引导模块（仅高层，生成置信图）
+        self.use_semantic_guidance = getattr(cfg, 'USE_SEMANTIC_GUIDANCE', True)
+        self.guidance_high_level_only = getattr(cfg, 'GUIDANCE_HIGH_LEVEL_ONLY', True)
 
-        if self.use_temporal_exchange:
-            if self.exchange_high_level_only:
-                # 只在高层（Stage 3-4）使用交换，低层保留None
-                self.exchange_modules = nn.ModuleList([
-                    None,  # Stage 1: 64 channels - 不交换
-                    None,  # Stage 2: 128 channels - 不交换
-                    TemporalExchangeModule(self.channels[2], use_gate=True),  # Stage 3: 320 channels
-                    TemporalExchangeModule(self.channels[3], use_gate=True)   # Stage 4: 512 channels
+        if self.use_semantic_guidance:
+            if self.guidance_high_level_only:
+                # 只在高层（Stage 3-4）生成语义引导
+                self.semantic_guides = nn.ModuleList([
+                    None,  # Stage 1: 不需要语义引导
+                    None,  # Stage 2: 不需要语义引导
+                    SemanticGuidanceModule(self.channels[2]),  # Stage 3: 320 channels
+                    SemanticGuidanceModule(self.channels[3])   # Stage 4: 512 channels
                 ])
-                print(f"  Temporal exchange: Enabled (high-level only, Stage 3-4 with gating)")
+                print(f"  Semantic guidance: Enabled (high-level only, Stage 3-4)")
             else:
-                # 所有层都使用交换
-                self.exchange_modules = nn.ModuleList([
-                    TemporalExchangeModule(ch, use_gate=True) for ch in self.channels
+                # 所有层都生成语义引导
+                self.semantic_guides = nn.ModuleList([
+                    SemanticGuidanceModule(ch) for ch in self.channels
                 ])
-                print(f"  Temporal exchange: Enabled (all stages with gating)")
+                print(f"  Semantic guidance: Enabled (all stages)")
         else:
-            self.exchange_modules = None
-            print(f"  Temporal exchange: Disabled")
+            self.semantic_guides = None
+            print(f"  Semantic guidance: Disabled")
 
         # 多尺度差异模块
         self.diff_modules = nn.ModuleList([
@@ -255,8 +250,8 @@ class SegFormerCD(nn.Module):
             self.aux_heads = None
 
         # 只初始化新增模块，不要动预训练的encoder！
-        if self.exchange_modules is not None:
-            self.exchange_modules.apply(self._init_weights)
+        if self.semantic_guides is not None:
+            self.semantic_guides.apply(self._init_weights)
         self.diff_modules.apply(self._init_weights)
         self.decoder.apply(self._init_weights)
         self.classifier.apply(self._init_weights)
@@ -357,31 +352,20 @@ class SegFormerCD(nn.Module):
         """
         B, _, H, W = img_a.shape
 
-        # 提取两个时刻的特征
+        # 提取两个时刻的特征（保持纯净，不被语义引导改变）
         feats_a = self._extract_features(img_a)
         feats_b = self._extract_features(img_b)
 
-        # 跨时序特征交换（语义引导，可能只在高层）
-        if self.exchange_modules is not None:
-            exchanged_a = []
-            exchanged_b = []
-            for i in range(len(self.channels)):
-                if self.exchange_modules[i] is not None:
-                    # 高层使用交换
-                    exc_a, exc_b = self.exchange_modules[i](feats_a[i], feats_b[i])
-                    exchanged_a.append(exc_a)
-                    exchanged_b.append(exc_b)
-                else:
-                    # 低层不交换，直接使用原特征
-                    exchanged_a.append(feats_a[i])
-                    exchanged_b.append(feats_b[i])
-            feats_a = exchanged_a
-            feats_b = exchanged_b
-
-        # 计算多尺度差异特征
+        # 计算多尺度差异特征（语义引导调制）
         diff_feats = []
         for i in range(len(self.channels)):
-            diff_feat = self.diff_modules[i](feats_a[i], feats_b[i])
+            # 生成语义引导置信图（仅高层）
+            guide = None
+            if self.semantic_guides is not None and self.semantic_guides[i] is not None:
+                guide = self.semantic_guides[i](feats_a[i], feats_b[i])  # (B, 1, H, W)
+
+            # 计算差异特征，并用guide调制
+            diff_feat = self.diff_modules[i](feats_a[i], feats_b[i], guide=guide)
             diff_feats.append(diff_feat)
 
         # 解码
