@@ -65,7 +65,7 @@ class Config:
 
     # 跨时序特征交换（语义引导模块）
     USE_TEMPORAL_EXCHANGE = True
-    EXCHANGE_RATIO = 0.5  # 交换通道比例
+    EXCHANGE_RATIO = 0.7  # 交换通道比例
 
     # ==================== 训练配置 ====================
     # 基础训练参数
@@ -78,12 +78,12 @@ class Config:
 
     # 优化器参数
     OPTIMIZER = "adamw"
-    LEARNING_RATE = 6e-5
+    LEARNING_RATE = 5e-4
     WEIGHT_DECAY = 0.01
     BETAS = (0.9, 0.999)
 
     # 学习率调度
-    LR_SCHEDULER = "polynomial"  # "polynomial", "cosine", "step"
+    LR_SCHEDULER = "cosine"  # "polynomial", "cosine", "step"
     LR_POWER = 0.9
     WARMUP_EPOCHS = 10
     WARMUP_LR = 1e-6
@@ -95,7 +95,7 @@ class Config:
     # 损失权重
     LOSS_WEIGHT_BCE = 0.5
     LOSS_WEIGHT_DICE = 0.5
-    LOSS_WEIGHT_BOUNDARY = 0.2
+    LOSS_WEIGHT_BOUNDARY = 0.1
 
     # Focal Loss参数（如果使用）
     FOCAL_ALPHA = 0.25
@@ -104,7 +104,7 @@ class Config:
     # 类别权重（处理类别不平衡）
     USE_CLASS_WEIGHTS = True
     # LEVIR-CD中变化像素约占5-10%，设置权重平衡
-    CLASS_WEIGHTS = [1.0, 10.0]  # [unchanged, changed]
+    CLASS_WEIGHTS = [1.0, 4.0]  # [unchanged, changed]
 
     # 混合精度训练
     USE_AMP = True
