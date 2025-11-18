@@ -63,6 +63,15 @@ class Config:
     DEEP_SUPERVISION = True
     DEEP_SUPERVISION_WEIGHTS = [1.0, 0.4, 0.2, 0.1]  # 各尺度权重
 
+    # 条带式感受野增强（改进版：残差连接 + 仅高层）
+    # 设计原则：
+    # 1. 保留完整的DifferenceModule作为baseline
+    # 2. Strip模块仅作为可选增强分支（残差连接）
+    # 3. 只在高层（Stage 3-4）应用，避免破坏低层细节
+    USE_STRIP_ENHANCE = True         # 启用条带式增强
+    STRIP_SIZE = 11                  # 条带卷积核大小（7, 11, 15）
+    STRIP_RESIDUAL_WEIGHT = 0.3      # 残差权重alpha（保守设置，0.2-0.5）
+
     # ==================== 训练配置 ====================
     # 基础训练参数
     BATCH_SIZE = 8  # 4060 8G显存，256x256图像

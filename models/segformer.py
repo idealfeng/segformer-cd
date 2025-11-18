@@ -6,6 +6,7 @@ SegFormer变化检测模型 - Siamese架构 + 多尺度差异融合
 2. 多尺度差异模块（|Fa-Fb| + (Fa+Fb) + 通道注意力）
 3. 轻量级MLP解码器
 4. 深度监督辅助损失
+5. 可选的条带式感受野增强（仅高层，残差连接）
 """
 import os
 import torch
@@ -13,6 +14,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import SegformerModel
 from config import cfg
+
+# 导入条带式感受野增强模块（可选）
+try:
+    from models.multi_direction_diff import StripContextModule
+except ImportError:
+    StripContextModule = None
 
 
 class ChannelAttention(nn.Module):
@@ -162,11 +169,29 @@ class SegFormerCD(nn.Module):
         # 获取各stage通道数
         self.channels = self.encoder.config.hidden_sizes  # e.g., [64, 128, 320, 512] for B1
 
-        # 多尺度差异模块
+        # 多尺度差异模块（Baseline）
         self.diff_modules = nn.ModuleList([
             DifferenceModule(ch, ch) for ch in self.channels
         ])
         print(f"  Difference modules: {len(self.diff_modules)} stages")
+
+        # 条带式感受野增强（可选，仅高层，残差连接）
+        self.use_strip_enhance = getattr(cfg, 'USE_STRIP_ENHANCE', False)
+        self.strip_residual_weight = getattr(cfg, 'STRIP_RESIDUAL_WEIGHT', 0.3)
+
+        if self.use_strip_enhance and StripContextModule is not None:
+            strip_size = getattr(cfg, 'STRIP_SIZE', 11)
+            # 只在高层（Stage 3-4）使用strip增强
+            self.strip_enhance = nn.ModuleList([
+                None,  # Stage 1: 不使用
+                None,  # Stage 2: 不使用
+                StripContextModule(self.channels[2], strip_size=strip_size),  # Stage 3
+                StripContextModule(self.channels[3], strip_size=strip_size),  # Stage 4
+            ])
+            print(f"  Strip enhancement: Enabled (Stage 3-4 only, strip_size={strip_size}, alpha={self.strip_residual_weight})")
+        else:
+            self.strip_enhance = None
+            print(f"  Strip enhancement: Disabled")
 
         # MLP解码器
         self.decoder = MLPDecoder(self.channels, embed_dim=256)
@@ -183,9 +208,9 @@ class SegFormerCD(nn.Module):
             self.aux_heads = None
 
         # 只初始化新增模块，不要动预训练的encoder！
-        if self.semantic_guides is not None:
-            self.semantic_guides.apply(self._init_weights)
         self.diff_modules.apply(self._init_weights)
+        if self.strip_enhance is not None:
+            self.strip_enhance.apply(self._init_weights)
         self.decoder.apply(self._init_weights)
         self.classifier.apply(self._init_weights)
         if self.aux_heads is not None:
@@ -289,10 +314,20 @@ class SegFormerCD(nn.Module):
         feats_a = self._extract_features(img_a)
         feats_b = self._extract_features(img_b)
 
-        # 计算多尺度差异特征
+        # 计算多尺度差异特征（支持条带式增强）
         diff_feats = []
         for i in range(len(self.channels)):
-            diff_feat = self.diff_modules[i](feats_a[i], feats_b[i])
+            # Baseline差异特征（保留完整的 |Fa-Fb| + (Fa+Fb) + CA）
+            base_diff = self.diff_modules[i](feats_a[i], feats_b[i])
+
+            # 条带式感受野增强（仅高层，残差连接）
+            if self.strip_enhance is not None and self.strip_enhance[i] is not None:
+                strip_feat = self.strip_enhance[i](feats_a[i], feats_b[i])
+                # 残差增强：out = base + alpha * strip
+                diff_feat = base_diff + self.strip_residual_weight * strip_feat
+            else:
+                diff_feat = base_diff
+
             diff_feats.append(diff_feat)
 
         # 解码
