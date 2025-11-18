@@ -64,14 +64,20 @@ class Config:
     DEEP_SUPERVISION_WEIGHTS = [1.0, 0.4, 0.2, 0.1]  # 各尺度权重
 
     # 语义引导模块（正交设计：不改变特征，只生成引导置信图）
-    USE_SEMANTIC_GUIDANCE = True
+    # 实验结果：该模块未带来提升，已禁用
+    USE_SEMANTIC_GUIDANCE = False
     GUIDANCE_HIGH_LEVEL_ONLY = True  # 仅在高层（Stage 3-4）生成语义引导
     GUIDE_MODULATION_MODE = 'soft'   # Guide调制模式: 'hard', 'soft', 'residual', 'attention'
+
+    # 多方向差分模块（Multi-Direction Difference Module）
+    # 灵感来源：RS-Mamba的全向扫描，捕获任意方向的变化
+    USE_MULTI_DIRECTION_DIFF = True  # 启用多方向差分
+    MULTI_DIR_SIMPLIFIED = True      # 使用简化版（更轻量）
 
     # ==================== 训练配置 ====================
     # 基础训练参数
     BATCH_SIZE = 8  # 4060 8G显存，256x256图像
-    NUM_EPOCHS = 200
+    NUM_EPOCHS = 300  # 实验发现300 epochs优于200 epochs
     NUM_WORKERS = 4
 
     # 梯度累积（等效batch_size = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS）
