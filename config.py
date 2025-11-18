@@ -69,10 +69,11 @@ class Config:
     GUIDANCE_HIGH_LEVEL_ONLY = True  # 仅在高层（Stage 3-4）生成语义引导
     GUIDE_MODULATION_MODE = 'soft'   # Guide调制模式: 'hard', 'soft', 'residual', 'attention'
 
-    # 多方向差分模块（Multi-Direction Difference Module）
-    # 灵感来源：RS-Mamba的全向扫描，捕获任意方向的变化
-    USE_MULTI_DIRECTION_DIFF = True  # 启用多方向差分
-    MULTI_DIR_SIMPLIFIED = True      # 使用简化版（更轻量）
+    # 条带式感受野模块（Strip Context Module）
+    # 核心思想：用横向/纵向条带卷积扩大感受野，捕获线性变化结构（道路、建筑边界等）
+    USE_MULTI_DIRECTION_DIFF = True  # 启用条带式感受野模块
+    MULTI_DIR_SIMPLIFIED = True      # 使用简化版（3分支：local + h_strip + v_strip）
+    STRIP_SIZE = 11                  # 条带卷积核大小（推荐7, 11, 15）
 
     # ==================== 训练配置 ====================
     # 基础训练参数

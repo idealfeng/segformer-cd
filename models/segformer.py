@@ -13,8 +13,8 @@ import torch.nn.functional as F
 from transformers import SegformerModel
 from config import cfg
 
-# 导入多方向差分模块
-from models.multi_direction_diff import MultiDirectionDiffModule, SimplifiedMultiDirectionDiff
+# 导入条带式感受野模块
+from models.multi_direction_diff import StripContextModule, StripContextModuleV2
 
 
 class ChannelAttention(nn.Module):
@@ -247,29 +247,30 @@ class SegFormerCD(nn.Module):
             self.semantic_guides = None
             print(f"  Semantic guidance: Disabled")
 
-        # 多尺度差异模块（支持多方向差分）
+        # 多尺度差异模块（支持条带式感受野）
         self.use_multi_direction = getattr(cfg, 'USE_MULTI_DIRECTION_DIFF', False)
         self.multi_dir_simplified = getattr(cfg, 'MULTI_DIR_SIMPLIFIED', True)
+        self.strip_size = getattr(cfg, 'STRIP_SIZE', 11)  # 条带卷积核大小
 
         if self.use_multi_direction:
             if self.multi_dir_simplified:
-                # 简化版：更轻量，参数少
+                # 条带式感受野模块：轻量版（3分支：local + h_strip + v_strip）
                 self.diff_modules = nn.ModuleList([
-                    SimplifiedMultiDirectionDiff(ch) for ch in self.channels
+                    StripContextModule(ch, strip_size=self.strip_size) for ch in self.channels
                 ])
-                print(f"  Multi-direction diff: Enabled (simplified version)")
+                print(f"  Strip context module: Enabled (3-branch, strip_size={self.strip_size})")
             else:
-                # 完整版：更复杂，方向注意力
+                # 条带式感受野模块：完整版（4分支：+ global pooling）
                 self.diff_modules = nn.ModuleList([
-                    MultiDirectionDiffModule(ch) for ch in self.channels
+                    StripContextModuleV2(ch, strip_size=self.strip_size) for ch in self.channels
                 ])
-                print(f"  Multi-direction diff: Enabled (full version with attention)")
+                print(f"  Strip context module: Enabled (4-branch with global, strip_size={self.strip_size})")
         else:
             # 原始单方向差异模块
             self.diff_modules = nn.ModuleList([
                 DifferenceModule(ch, ch) for ch in self.channels
             ])
-            print(f"  Multi-direction diff: Disabled (using standard diff)")
+            print(f"  Strip context module: Disabled (using standard diff)")
 
         # MLP解码器
         self.decoder = MLPDecoder(self.channels, embed_dim=256)
