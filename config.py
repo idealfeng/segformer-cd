@@ -63,9 +63,10 @@ class Config:
     DEEP_SUPERVISION = True
     DEEP_SUPERVISION_WEIGHTS = [1.0, 0.4, 0.2, 0.1]  # 各尺度权重
 
-    # 跨时序特征交换（语义引导模块）
+    # 跨时序特征交换（语义引导模块 - 改进版）
     USE_TEMPORAL_EXCHANGE = True
-    EXCHANGE_RATIO = 0.7  # 交换通道比例
+    EXCHANGE_HIGH_LEVEL_ONLY = True  # 仅在高层（Stage 3-4）使用交换，低层保留纹理特征
+    # EXCHANGE_RATIO = 0.7  # 已废弃，使用自适应门控机制
 
     # ==================== 训练配置 ====================
     # 基础训练参数

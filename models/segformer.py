@@ -37,27 +37,37 @@ class ChannelAttention(nn.Module):
 
 class TemporalExchangeModule(nn.Module):
     """
-    跨时序特征交换模块 (Temporal Feature Exchange)
+    跨时序特征交换模块 (Temporal Feature Exchange) - 改进版
 
-    核心思想：交换两时相特征的部分通道，使得：
-    - 每个时相特征都包含对方的语义信息（语义引导）
-    - 同时保留自身的空间信息（空间定位）
+    核心改进：
+    1. 残差连接：feat + gate * other_feat (保证下界)
+    2. 通道门控：每个通道自适应学习交换强度
+    3. 只在高层使用：语义特征更适合交换
 
-    参考：EDED架构 (IEEE TGRS 2023)
+    参考：EDED架构 (IEEE TGRS 2023) + 门控机制
     """
-    def __init__(self, channels, exchange_ratio=0.5):
+    def __init__(self, channels, use_gate=True):
         super().__init__()
-        self.exchange_ratio = exchange_ratio
-        self.split_channels = int(channels * exchange_ratio)
+        self.use_gate = use_gate
 
-        # 交换后的特征融合（学习最优组合权重）
-        self.fusion_a = nn.Sequential(
-            nn.Conv2d(channels, channels, 1, bias=False),
+        if use_gate:
+            # 通道门控：学习每个通道的交换强度
+            self.channel_gate = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels * 2, channels // 4, 1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channels // 4, channels, 1, bias=False),
+                nn.Sigmoid()  # 输出0-1，控制交换强度
+            )
+
+        # 交换后的特征细化
+        self.refine_a = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True)
         )
-        self.fusion_b = nn.Sequential(
-            nn.Conv2d(channels, channels, 1, bias=False),
+        self.refine_b = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True)
         )
@@ -71,16 +81,22 @@ class TemporalExchangeModule(nn.Module):
             exchanged_a: 包含B语义的A特征
             exchanged_b: 包含A语义的B特征
         """
-        # 通道交换：前half来自对方，后half保留自己
-        split = self.split_channels
+        if self.use_gate:
+            # 通道门控：自适应决定交换强度
+            concat = torch.cat([feat_a, feat_b], dim=1)
+            gate = self.channel_gate(concat)  # (B, C, 1, 1)
 
-        # A的前半部分换成B的，B的前半部分换成A的
-        exchanged_a = torch.cat([feat_b[:, :split], feat_a[:, split:]], dim=1)
-        exchanged_b = torch.cat([feat_a[:, :split], feat_b[:, split:]], dim=1)
+            # 残差式交换：原特征 + 门控 * 对方特征
+            exchanged_a = feat_a + gate * feat_b
+            exchanged_b = feat_b + gate * feat_a
+        else:
+            # 简单残差：直接加权融合
+            exchanged_a = feat_a + 0.5 * feat_b
+            exchanged_b = feat_b + 0.5 * feat_a
 
-        # 融合交换后的特征
-        exchanged_a = self.fusion_a(exchanged_a)
-        exchanged_b = self.fusion_b(exchanged_b)
+        # 细化交换后的特征
+        exchanged_a = self.refine_a(exchanged_a)
+        exchanged_b = self.refine_b(exchanged_b)
 
         return exchanged_a, exchanged_b
 
@@ -195,13 +211,26 @@ class SegFormerCD(nn.Module):
         # 获取各stage通道数
         self.channels = self.encoder.config.hidden_sizes  # e.g., [64, 128, 320, 512] for B1
 
-        # 跨时序特征交换模块（语义引导）
+        # 跨时序特征交换模块（语义引导，仅高层）
         self.use_temporal_exchange = getattr(cfg, 'USE_TEMPORAL_EXCHANGE', True)
+        self.exchange_high_level_only = getattr(cfg, 'EXCHANGE_HIGH_LEVEL_ONLY', True)
+
         if self.use_temporal_exchange:
-            self.exchange_modules = nn.ModuleList([
-                TemporalExchangeModule(ch, exchange_ratio=0.5) for ch in self.channels
-            ])
-            print(f"  Temporal exchange: Enabled (ratio=0.5)")
+            if self.exchange_high_level_only:
+                # 只在高层（Stage 3-4）使用交换，低层保留None
+                self.exchange_modules = nn.ModuleList([
+                    None,  # Stage 1: 64 channels - 不交换
+                    None,  # Stage 2: 128 channels - 不交换
+                    TemporalExchangeModule(self.channels[2], use_gate=True),  # Stage 3: 320 channels
+                    TemporalExchangeModule(self.channels[3], use_gate=True)   # Stage 4: 512 channels
+                ])
+                print(f"  Temporal exchange: Enabled (high-level only, Stage 3-4 with gating)")
+            else:
+                # 所有层都使用交换
+                self.exchange_modules = nn.ModuleList([
+                    TemporalExchangeModule(ch, use_gate=True) for ch in self.channels
+                ])
+                print(f"  Temporal exchange: Enabled (all stages with gating)")
         else:
             self.exchange_modules = None
             print(f"  Temporal exchange: Disabled")
@@ -332,14 +361,20 @@ class SegFormerCD(nn.Module):
         feats_a = self._extract_features(img_a)
         feats_b = self._extract_features(img_b)
 
-        # 跨时序特征交换（语义引导）
+        # 跨时序特征交换（语义引导，可能只在高层）
         if self.exchange_modules is not None:
             exchanged_a = []
             exchanged_b = []
             for i in range(len(self.channels)):
-                exc_a, exc_b = self.exchange_modules[i](feats_a[i], feats_b[i])
-                exchanged_a.append(exc_a)
-                exchanged_b.append(exc_b)
+                if self.exchange_modules[i] is not None:
+                    # 高层使用交换
+                    exc_a, exc_b = self.exchange_modules[i](feats_a[i], feats_b[i])
+                    exchanged_a.append(exc_a)
+                    exchanged_b.append(exc_b)
+                else:
+                    # 低层不交换，直接使用原特征
+                    exchanged_a.append(feats_a[i])
+                    exchanged_b.append(feats_b[i])
             feats_a = exchanged_a
             feats_b = exchanged_b
 
