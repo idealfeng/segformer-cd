@@ -78,7 +78,7 @@ class Config:
 
     # 优化器参数
     OPTIMIZER = "adamw"
-    LEARNING_RATE = 5e-4
+    LEARNING_RATE = 5e-4  # 最佳学习率（调参实验得出）
     WEIGHT_DECAY = 0.01
     BETAS = (0.9, 0.999)
 
@@ -104,7 +104,7 @@ class Config:
     # 类别权重（处理类别不平衡）
     USE_CLASS_WEIGHTS = True
     # LEVIR-CD中变化像素约占5-10%，设置权重平衡
-    CLASS_WEIGHTS = [1.0, 4.0]  # [unchanged, changed]
+    CLASS_WEIGHTS = [1.0, 4.0]  # [unchanged, changed] - 最佳权重（调参实验得出）
 
     # 混合精度训练
     USE_AMP = True
