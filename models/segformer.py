@@ -116,8 +116,22 @@ class DifferenceModule(nn.Module):
         # 语义引导：用置信图调制差异响应
         if guide is not None:
             # guide ∈ (0,1) 表示"该位置变化的概率"
-            # 高置信区域的差异特征被增强，低置信区域被抑制
-            out = out * guide
+            # 方案选择（config可配置）
+            guide_mode = getattr(cfg, 'GUIDE_MODULATION_MODE', 'soft')
+
+            if guide_mode == 'hard':
+                # 原始方案：直接相乘（可能过aggressive）
+                out = out * guide
+            elif guide_mode == 'soft':
+                # 软调制：避免完全抑制 (推荐)
+                out = out * (0.5 + 0.5 * guide)
+            elif guide_mode == 'residual':
+                # 残差式：guide作为加权残差
+                out = out + out * (guide - 0.5)
+            elif guide_mode == 'attention':
+                # 注意力式：增强对比度
+                guide_enhanced = torch.sigmoid(2 * (guide - 0.5))
+                out = out * guide_enhanced
 
         # 通道注意力增强
         out = self.ca(out)

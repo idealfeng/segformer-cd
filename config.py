@@ -66,6 +66,7 @@ class Config:
     # 语义引导模块（正交设计：不改变特征，只生成引导置信图）
     USE_SEMANTIC_GUIDANCE = True
     GUIDANCE_HIGH_LEVEL_ONLY = True  # 仅在高层（Stage 3-4）生成语义引导
+    GUIDE_MODULATION_MODE = 'soft'   # Guide调制模式: 'hard', 'soft', 'residual', 'attention'
 
     # ==================== 训练配置 ====================
     # 基础训练参数
