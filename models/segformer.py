@@ -1,9 +1,10 @@
 """
 SegFormer变化检测模型 - Siamese架构 + 多尺度差异融合
-核心创新点：
+
+核心设计：
 1. 共享权重的Siamese编码器
-2. 多方向差异模块（可选）/ 多尺度时序差异模块 (MTDM)
-3. 通道注意力增强的差异特征
+2. 多尺度差异模块（|Fa-Fb| + (Fa+Fb) + 通道注意力）
+3. 轻量级MLP解码器
 4. 深度监督辅助损失
 """
 import os
@@ -12,9 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import SegformerModel
 from config import cfg
-
-# 导入条带式感受野模块
-from models.multi_direction_diff import StripContextModule, StripContextModuleV2
 
 
 class ChannelAttention(nn.Module):
@@ -38,57 +36,18 @@ class ChannelAttention(nn.Module):
         return x * attention
 
 
-class SemanticGuidanceModule(nn.Module):
-    """
-    语义引导模块 - 生成变化区域置信图
-
-    核心思想（正交设计）：
-    1. 不改变原始特征，保持差异计算纯净
-    2. 融合双时相语义特征，生成"哪里可能变化"的置信图
-    3. 用置信图去调制差异特征的响应
-
-    这才是真正的"语义引导 + 空间定位"：
-    - 语义融合 → 确定大致变化区域（guide mask）
-    - 空间差异 → 精确定位变化地物（|Fa - Fb|）
-    """
-    def __init__(self, channels):
-        super().__init__()
-        # 语义融合网络：产生变化置信图
-        self.guidance_net = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels // 2, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 2, 1, 1),  # 输出1通道置信图
-            nn.Sigmoid()  # (0, 1) 表示变化概率
-        )
-
-    def forward(self, feat_a, feat_b):
-        """
-        Args:
-            feat_a: 时刻A特征 (B, C, H, W)
-            feat_b: 时刻B特征 (B, C, H, W)
-        Returns:
-            guide: 变化置信图 (B, 1, H, W) ∈ (0, 1)
-        """
-        # 拼接双时相语义特征
-        concat = torch.cat([feat_a, feat_b], dim=1)
-        # 生成变化置信图
-        guide = self.guidance_net(concat)  # (B, 1, H, W)
-        return guide
-
-
 class DifferenceModule(nn.Module):
     """
-    差异计算模块（支持语义引导）
+    差异计算模块
 
-    改进：接受可选的guide mask来调制差异响应
+    设计思路：
+    1. 计算空间差异：|Fa - Fb|（变化在哪里）
+    2. 保留语义信息：Fa + Fb（这里是什么）
+    3. 通道注意力增强重要特征
     """
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        # 差异特征融合
+        # 差异特征融合：concat([|Fa-Fb|, Fa+Fb]) -> conv
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels * 2, out_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
@@ -100,41 +59,21 @@ class DifferenceModule(nn.Module):
         # 通道注意力
         self.ca = ChannelAttention(out_channels)
 
-    def forward(self, feat_a, feat_b, guide=None):
+    def forward(self, feat_a, feat_b):
         """
         Args:
             feat_a: 时刻A特征 (B, C, H, W)
             feat_b: 时刻B特征 (B, C, H, W)
-            guide: 语义引导置信图 (B, 1, H, W) [可选]
         Returns:
             out: 差异特征 (B, C, H, W)
         """
-        # 计算差异特征（保持纯净，不被语义交换污染）
-        diff = torch.abs(feat_a - feat_b)
-        # 拼接原始特征和差异特征
-        concat = torch.cat([diff, feat_a + feat_b], dim=1)
-        # 融合
+        # 计算差异和语义
+        diff = torch.abs(feat_a - feat_b)       # 空间差异
+        semantic = feat_a + feat_b               # 语义信息
+
+        # 拼接并融合
+        concat = torch.cat([diff, semantic], dim=1)
         out = self.conv(concat)
-
-        # 语义引导：用置信图调制差异响应
-        if guide is not None:
-            # guide ∈ (0,1) 表示"该位置变化的概率"
-            # 方案选择（config可配置）
-            guide_mode = getattr(cfg, 'GUIDE_MODULATION_MODE', 'soft')
-
-            if guide_mode == 'hard':
-                # 原始方案：直接相乘（可能过aggressive）
-                out = out * guide
-            elif guide_mode == 'soft':
-                # 软调制：避免完全抑制 (推荐)
-                out = out * (0.5 + 0.5 * guide)
-            elif guide_mode == 'residual':
-                # 残差式：guide作为加权残差
-                out = out + out * (guide - 0.5)
-            elif guide_mode == 'attention':
-                # 注意力式：增强对比度
-                guide_enhanced = torch.sigmoid(2 * (guide - 0.5))
-                out = out * guide_enhanced
 
         # 通道注意力增强
         out = self.ca(out)
@@ -223,54 +162,11 @@ class SegFormerCD(nn.Module):
         # 获取各stage通道数
         self.channels = self.encoder.config.hidden_sizes  # e.g., [64, 128, 320, 512] for B1
 
-        # 语义引导模块（仅高层，生成置信图）
-        self.use_semantic_guidance = getattr(cfg, 'USE_SEMANTIC_GUIDANCE', True)
-        self.guidance_high_level_only = getattr(cfg, 'GUIDANCE_HIGH_LEVEL_ONLY', True)
-
-        if self.use_semantic_guidance:
-            if self.guidance_high_level_only:
-                # 只在高层（Stage 3-4）生成语义引导
-                self.semantic_guides = nn.ModuleList([
-                    None,  # Stage 1: 不需要语义引导
-                    None,  # Stage 2: 不需要语义引导
-                    SemanticGuidanceModule(self.channels[2]),  # Stage 3: 320 channels
-                    SemanticGuidanceModule(self.channels[3])   # Stage 4: 512 channels
-                ])
-                print(f"  Semantic guidance: Enabled (high-level only, Stage 3-4)")
-            else:
-                # 所有层都生成语义引导
-                self.semantic_guides = nn.ModuleList([
-                    SemanticGuidanceModule(ch) for ch in self.channels
-                ])
-                print(f"  Semantic guidance: Enabled (all stages)")
-        else:
-            self.semantic_guides = None
-            print(f"  Semantic guidance: Disabled")
-
-        # 多尺度差异模块（支持条带式感受野）
-        self.use_multi_direction = getattr(cfg, 'USE_MULTI_DIRECTION_DIFF', False)
-        self.multi_dir_simplified = getattr(cfg, 'MULTI_DIR_SIMPLIFIED', True)
-        self.strip_size = getattr(cfg, 'STRIP_SIZE', 11)  # 条带卷积核大小
-
-        if self.use_multi_direction:
-            if self.multi_dir_simplified:
-                # 条带式感受野模块：轻量版（3分支：local + h_strip + v_strip）
-                self.diff_modules = nn.ModuleList([
-                    StripContextModule(ch, strip_size=self.strip_size) for ch in self.channels
-                ])
-                print(f"  Strip context module: Enabled (3-branch, strip_size={self.strip_size})")
-            else:
-                # 条带式感受野模块：完整版（4分支：+ global pooling）
-                self.diff_modules = nn.ModuleList([
-                    StripContextModuleV2(ch, strip_size=self.strip_size) for ch in self.channels
-                ])
-                print(f"  Strip context module: Enabled (4-branch with global, strip_size={self.strip_size})")
-        else:
-            # 原始单方向差异模块
-            self.diff_modules = nn.ModuleList([
-                DifferenceModule(ch, ch) for ch in self.channels
-            ])
-            print(f"  Strip context module: Disabled (using standard diff)")
+        # 多尺度差异模块
+        self.diff_modules = nn.ModuleList([
+            DifferenceModule(ch, ch) for ch in self.channels
+        ])
+        print(f"  Difference modules: {len(self.diff_modules)} stages")
 
         # MLP解码器
         self.decoder = MLPDecoder(self.channels, embed_dim=256)
@@ -389,20 +285,14 @@ class SegFormerCD(nn.Module):
         """
         B, _, H, W = img_a.shape
 
-        # 提取两个时刻的特征（保持纯净，不被语义引导改变）
+        # 提取两个时刻的特征
         feats_a = self._extract_features(img_a)
         feats_b = self._extract_features(img_b)
 
-        # 计算多尺度差异特征（语义引导调制）
+        # 计算多尺度差异特征
         diff_feats = []
         for i in range(len(self.channels)):
-            # 生成语义引导置信图（仅高层）
-            guide = None
-            if self.semantic_guides is not None and self.semantic_guides[i] is not None:
-                guide = self.semantic_guides[i](feats_a[i], feats_b[i])  # (B, 1, H, W)
-
-            # 计算差异特征，并用guide调制
-            diff_feat = self.diff_modules[i](feats_a[i], feats_b[i], guide=guide)
+            diff_feat = self.diff_modules[i](feats_a[i], feats_b[i])
             diff_feats.append(diff_feat)
 
         # 解码

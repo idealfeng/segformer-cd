@@ -63,18 +63,6 @@ class Config:
     DEEP_SUPERVISION = True
     DEEP_SUPERVISION_WEIGHTS = [1.0, 0.4, 0.2, 0.1]  # 各尺度权重
 
-    # 语义引导模块（正交设计：不改变特征，只生成引导置信图）
-    # 实验结果：该模块未带来提升，已禁用
-    USE_SEMANTIC_GUIDANCE = False
-    GUIDANCE_HIGH_LEVEL_ONLY = True  # 仅在高层（Stage 3-4）生成语义引导
-    GUIDE_MODULATION_MODE = 'soft'   # Guide调制模式: 'hard', 'soft', 'residual', 'attention'
-
-    # 条带式感受野模块（Strip Context Module）
-    # 核心思想：用横向/纵向条带卷积扩大感受野，捕获线性变化结构（道路、建筑边界等）
-    USE_MULTI_DIRECTION_DIFF = True  # 启用条带式感受野模块
-    MULTI_DIR_SIMPLIFIED = True      # 使用简化版（3分支：local + h_strip + v_strip）
-    STRIP_SIZE = 11                  # 条带卷积核大小（推荐7, 11, 15）
-
     # ==================== 训练配置 ====================
     # 基础训练参数
     BATCH_SIZE = 8  # 4060 8G显存，256x256图像
