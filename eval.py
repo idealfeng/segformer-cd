@@ -273,18 +273,28 @@ class Evaluator:
         return results
 
     @torch.no_grad()
-    def visualize(self, num_samples=10, save_dir=None):
-        """可视化预测结果"""
+    def visualize(self, num_samples=10, save_dir=None, visualize_all=False):
+        """可视化预测结果
+
+        Args:
+            num_samples: 可视化样本数量（当visualize_all=False时生效）
+            save_dir: 保存目录
+            visualize_all: 是否可视化全部测试集
+        """
         if save_dir is None:
             save_dir = cfg.VIS_DIR / 'predictions'
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\nSaving visualizations to {save_dir}...")
+        total_samples = len(self.test_loader.dataset)
+        if visualize_all:
+            print(f"\nSaving ALL {total_samples} visualizations to {save_dir}...")
+        else:
+            print(f"\nSaving {min(num_samples, total_samples)} visualizations to {save_dir}...")
 
         count = 0
         for batch in tqdm(self.test_loader, desc='Visualizing'):
-            if count >= num_samples:
+            if not visualize_all and count >= num_samples:
                 break
 
             img_a = batch['img_a'].to(self.device)
@@ -334,6 +344,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
     parser.add_argument('--compute-fps', action='store_true', help='Compute FPS')
     parser.add_argument('--visualize', action='store_true', help='Save visualizations')
+    parser.add_argument('--visualize-all', action='store_true', help='Visualize all test samples (overrides --num-vis)')
     parser.add_argument('--num-vis', type=int, default=10, help='Number of visualizations')
     parser.add_argument('--num-warmup', type=int, default=10, help='FPS warmup iterations')
     parser.add_argument('--num-measure', type=int, default=100, help='FPS measurement iterations')
@@ -380,7 +391,10 @@ def main():
 
     # 可视化
     if args.visualize:
-        evaluator.visualize(num_samples=args.num_vis)
+        evaluator.visualize(
+            num_samples=args.num_vis,
+            visualize_all=args.visualize_all
+        )
 
     # 保存结果
     results_path = cfg.RESULTS_DIR / 'eval_results.json'
