@@ -2,7 +2,7 @@
 SegFormer变化检测模型 - Siamese架构 + 多尺度差异融合
 核心创新点：
 1. 共享权重的Siamese编码器
-2. 多尺度时序差异模块 (MTDM)
+2. 多方向差异模块（可选）/ 多尺度时序差异模块 (MTDM)
 3. 通道注意力增强的差异特征
 4. 深度监督辅助损失
 """
@@ -12,6 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import SegformerModel
 from config import cfg
+
+# 导入多方向差分模块
+from models.multi_direction_diff import MultiDirectionDiffModule, SimplifiedMultiDirectionDiff
 
 
 class ChannelAttention(nn.Module):
@@ -244,10 +247,29 @@ class SegFormerCD(nn.Module):
             self.semantic_guides = None
             print(f"  Semantic guidance: Disabled")
 
-        # 多尺度差异模块
-        self.diff_modules = nn.ModuleList([
-            DifferenceModule(ch, ch) for ch in self.channels
-        ])
+        # 多尺度差异模块（支持多方向差分）
+        self.use_multi_direction = getattr(cfg, 'USE_MULTI_DIRECTION_DIFF', False)
+        self.multi_dir_simplified = getattr(cfg, 'MULTI_DIR_SIMPLIFIED', True)
+
+        if self.use_multi_direction:
+            if self.multi_dir_simplified:
+                # 简化版：更轻量，参数少
+                self.diff_modules = nn.ModuleList([
+                    SimplifiedMultiDirectionDiff(ch) for ch in self.channels
+                ])
+                print(f"  Multi-direction diff: Enabled (simplified version)")
+            else:
+                # 完整版：更复杂，方向注意力
+                self.diff_modules = nn.ModuleList([
+                    MultiDirectionDiffModule(ch) for ch in self.channels
+                ])
+                print(f"  Multi-direction diff: Enabled (full version with attention)")
+        else:
+            # 原始单方向差异模块
+            self.diff_modules = nn.ModuleList([
+                DifferenceModule(ch, ch) for ch in self.channels
+            ])
+            print(f"  Multi-direction diff: Disabled (using standard diff)")
 
         # MLP解码器
         self.decoder = MLPDecoder(self.channels, embed_dim=256)
