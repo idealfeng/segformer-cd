@@ -71,11 +71,11 @@ class Config:
     STRIP_RESIDUAL_WEIGHT = 0.3
 
     # 轻量级ASPP（Atrous Spatial Pyramid Pooling）
-    # 设计：在decoder输出的fused feature上增强多尺度上下文
-    # 位置：decoder → ASPP → classifier
-    USE_ASPP = True                  # 启用ASPP
-    ASPP_CHANNELS = 256              # ASPP输出通道数
-    ASPP_DILATIONS = [1, 2, 4]       # 膨胀率（1×1, rate=2, rate=4）
+    # 实验结果：F1=89.83% vs baseline 90.42%（下降0.59%）
+    # 结论：decoder增强也失败，baseline架构已足够好
+    USE_ASPP = False                 # 已禁用
+    ASPP_CHANNELS = 256
+    ASPP_DILATIONS = [1, 2, 4]
 
     # ==================== 训练配置 ====================
     # 基础训练参数
