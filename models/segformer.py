@@ -6,7 +6,7 @@ SegFormer变化检测模型 - Siamese架构 + 多尺度差异融合
 2. 多尺度差异模块（|Fa-Fb| + (Fa+Fb) + 通道注意力）
 3. 轻量级MLP解码器
 4. 深度监督辅助损失
-5. 可选的条带式感受野增强（仅高层，残差连接）
+5. 轻量级ASPP增强解码器特征（多尺度上下文聚合）
 """
 import os
 import torch
@@ -15,7 +15,14 @@ import torch.nn.functional as F
 from transformers import SegformerModel
 from config import cfg
 
-# 导入条带式感受野增强模块（可选）
+# 导入ASPP模块
+try:
+    from models.aspp import LightweightASPP, SimplifiedASPP
+except ImportError:
+    LightweightASPP = None
+    SimplifiedASPP = None
+
+# 导入条带式感受野增强模块（实验证明失败，保留代码供参考）
 try:
     from models.multi_direction_diff import StripContextModule
 except ImportError:
@@ -196,8 +203,25 @@ class SegFormerCD(nn.Module):
         # MLP解码器
         self.decoder = MLPDecoder(self.channels, embed_dim=256)
 
+        # ASPP模块（可选，增强decoder输出的多尺度上下文）
+        self.use_aspp = getattr(cfg, 'USE_ASPP', False)
+        if self.use_aspp and LightweightASPP is not None:
+            aspp_channels = getattr(cfg, 'ASPP_CHANNELS', 256)
+            dilations = getattr(cfg, 'ASPP_DILATIONS', [1, 2, 4])
+            self.aspp = LightweightASPP(
+                in_channels=256,
+                out_channels=aspp_channels,
+                dilations=dilations
+            )
+            print(f"  ASPP: Enabled (dilations={dilations})")
+            classifier_in_channels = aspp_channels
+        else:
+            self.aspp = None
+            print(f"  ASPP: Disabled")
+            classifier_in_channels = 256
+
         # 最终分类头
-        self.classifier = nn.Conv2d(256, num_classes, 1)
+        self.classifier = nn.Conv2d(classifier_in_channels, num_classes, 1)
 
         # 深度监督头（可选）
         if cfg.DEEP_SUPERVISION:
@@ -212,6 +236,8 @@ class SegFormerCD(nn.Module):
         if self.strip_enhance is not None:
             self.strip_enhance.apply(self._init_weights)
         self.decoder.apply(self._init_weights)
+        if self.aspp is not None:
+            self.aspp.apply(self._init_weights)
         self.classifier.apply(self._init_weights)
         if self.aux_heads is not None:
             self.aux_heads.apply(self._init_weights)
@@ -332,6 +358,10 @@ class SegFormerCD(nn.Module):
 
         # 解码
         decoded = self.decoder(diff_feats)
+
+        # ASPP增强（可选）
+        if self.aspp is not None:
+            decoded = self.aspp(decoded)
 
         # 分类
         logits = self.classifier(decoded)

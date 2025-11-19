@@ -63,14 +63,19 @@ class Config:
     DEEP_SUPERVISION = True
     DEEP_SUPERVISION_WEIGHTS = [1.0, 0.4, 0.2, 0.1]  # 各尺度权重
 
-    # 条带式感受野增强（改进版：残差连接 + 仅高层）
-    # 设计原则：
-    # 1. 保留完整的DifferenceModule作为baseline
-    # 2. Strip模块仅作为可选增强分支（残差连接）
-    # 3. 只在高层（Stage 3-4）应用，避免破坏低层细节
-    USE_STRIP_ENHANCE = True         # 启用条带式增强
-    STRIP_SIZE = 11                  # 条带卷积核大小（7, 11, 15）
-    STRIP_RESIDUAL_WEIGHT = 0.3      # 残差权重alpha（保守设置，0.2-0.5）
+    # 条带式感受野增强（实验结论：失败）
+    # 实验结果：F1=90.11% vs baseline 90.42%（下降0.31%）
+    # 结论：在diff feature上扩大感受野是错误方向
+    USE_STRIP_ENHANCE = False        # 已禁用
+    STRIP_SIZE = 11
+    STRIP_RESIDUAL_WEIGHT = 0.3
+
+    # 轻量级ASPP（Atrous Spatial Pyramid Pooling）
+    # 设计：在decoder输出的fused feature上增强多尺度上下文
+    # 位置：decoder → ASPP → classifier
+    USE_ASPP = True                  # 启用ASPP
+    ASPP_CHANNELS = 256              # ASPP输出通道数
+    ASPP_DILATIONS = [1, 2, 4]       # 膨胀率（1×1, rate=2, rate=4）
 
     # ==================== 训练配置 ====================
     # 基础训练参数
