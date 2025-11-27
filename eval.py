@@ -15,29 +15,28 @@ import json
 import time
 from PIL import Image
 from torch.utils.data import DataLoader
-
+from models.simple_cd import build_simple_model
 from config import cfg
 from dataset import create_dataloaders
 from models.segformer import build_model
 
 
 class Evaluator:
-    """变化检测评估器"""
-
-    def __init__(self, checkpoint_path, device='cuda', batch_size=8):
+    def __init__(self, checkpoint_path, device='cuda', batch_size=8, model_type='segformer'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.batch_size = batch_size
+        self.model_type = model_type
 
-        print("=" * 60)
-        print("Loading model...")
-        print("=" * 60)
-
-        self.model = self.load_model(checkpoint_path)
+        # 1) 先构建 test_loader
         self.test_loader = self.build_test_loader()
 
+        # 2) 再加载模型
+        self.model = self.load_model(checkpoint_path)
+
         print(f"Test samples: {len(self.test_loader.dataset)}")
-        print(f"Batch size: {batch_size}")
+        print(f"Batch size: {self.test_loader.batch_size}")
         print(f"Device: {self.device}")
+
 
     def load_model(self, checkpoint_path):
         """加载模型"""
@@ -45,16 +44,41 @@ class Evaluator:
 
         # 从checkpoint获取配置
         config = checkpoint.get('config', {})
-        model_type = config.get('model_type', cfg.MODEL_TYPE)
         num_classes = config.get('num_classes', cfg.NUM_CLASSES)
 
-        # 构建模型
-        variant = model_type.split('_')[-1]
-        model = build_model(
-            variant=variant,
-            pretrained=False,  # 不需要预训练，直接加载权重
-            num_classes=num_classes
-        )
+        # 构建模型（根据model_type选择）
+
+        if self.model_type == 'simple':
+
+            print("Using Simple ResNet18 Siamese Model")
+
+            model = build_simple_model(
+
+                backbone='resnet18',
+
+                pretrained=False,
+
+                num_classes=num_classes
+
+            )
+
+        else:
+
+            print("Using SegFormer Model")
+
+            model_config_type = config.get('model_type', cfg.MODEL_TYPE)
+
+            variant = model_config_type.split('_')[-1]
+
+            model = build_model(
+
+                variant=variant,
+
+                pretrained=False,  # 不需要预训练，直接加载权重
+
+                num_classes=num_classes
+
+            )
 
         # 加载权重
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -341,21 +365,38 @@ class Evaluator:
 def main():
     parser = argparse.ArgumentParser(description='Change Detection Evaluation')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint')
+    parser.add_argument('--model', type=str, default='segformer', choices=['segformer', 'simple'],
+
+                        help='Model type: segformer (default) or simple (ResNet18)')
+
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
+
     parser.add_argument('--compute-fps', action='store_true', help='Compute FPS')
+
     parser.add_argument('--visualize', action='store_true', help='Save visualizations')
+
     parser.add_argument('--visualize-all', action='store_true', help='Visualize all test samples (overrides --num-vis)')
+
     parser.add_argument('--num-vis', type=int, default=10, help='Number of visualizations')
+
     parser.add_argument('--num-warmup', type=int, default=10, help='FPS warmup iterations')
+
     parser.add_argument('--num-measure', type=int, default=100, help='FPS measurement iterations')
 
     args = parser.parse_args()
 
     # 创建评估器
+
     evaluator = Evaluator(
+
         checkpoint_path=args.checkpoint,
+
         device=cfg.DEVICE,
-        batch_size=args.batch_size
+
+        batch_size=args.batch_size,
+
+        model_type=args.model
+
     )
 
     # 打印模型统计

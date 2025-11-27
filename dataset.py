@@ -42,7 +42,7 @@ class LEVIRCDDataset(Dataset):
         split_dir = self.root_dir / split
         self.img_a_dir = split_dir / 'A'
         self.img_b_dir = split_dir / 'B'
-        self.label_dir = split_dir / 'label'
+        self.label_dir = split_dir / 'OUT'
 
         # 获取所有图像文件名
         self.img_names = self._get_image_names()
@@ -55,12 +55,18 @@ class LEVIRCDDataset(Dataset):
             raise FileNotFoundError(f"Directory not found: {self.img_a_dir}")
 
         # 获取A目录下所有png文件
+        # 优先查找 bmp，因为你的截图显示是 bmp
         img_names = sorted([
-            f.stem for f in self.img_a_dir.glob('*.png')
+            f.stem for f in self.img_a_dir.glob('*.bmp')
         ])
 
+        # 如果没有bmp，再找找png或jpg作为备选
         if len(img_names) == 0:
-            # 尝试jpg格式
+            img_names = sorted([
+                f.stem for f in self.img_a_dir.glob('*.png')
+            ])
+
+        if len(img_names) == 0:
             img_names = sorted([
                 f.stem for f in self.img_a_dir.glob('*.jpg')
             ])
@@ -71,34 +77,53 @@ class LEVIRCDDataset(Dataset):
         return len(self.img_names)
 
     def __getitem__(self, idx: int) -> dict:
-        img_name = self.img_names[idx]
+        # img_name 这里拿到的是类似 "1_A" (不带后缀)
+        name_a = self.img_names[idx]
 
-        # 尝试加载png，如果不存在则尝试jpg
-        img_a_path = self.img_a_dir / f"{img_name}.png"
-        if not img_a_path.exists():
-            img_a_path = self.img_a_dir / f"{img_name}.jpg"
+        # --- 关键逻辑：处理文件名后缀不一致 ---
+        # 假设 A 中的文件名是 "1_A"，我们需要把 "_A" 换成 "_B" 去找 B图片
+        # 把 "_A" 换成 "_OUT" 去找标签
+        if name_a.endswith('_A'):
+            base_name = name_a[:-2]  # 去掉最后两个字符 "_A"
+            name_b = f"{base_name}_B"
+            name_label = f"{base_name}_OUT"
+        else:
+            # 如果文件名里没有 _A，则假设文件名一致
+            name_b = name_a
+            name_label = name_a
 
-        img_b_path = self.img_b_dir / f"{img_name}.png"
-        if not img_b_path.exists():
-            img_b_path = self.img_b_dir / f"{img_name}.jpg"
+        # 构建完整路径 (这里假设是 bmp，为了稳健可以保留之前的检测逻辑，但下面的写法更简洁)
+        # 如果你的数据全是 bmp，直接写 bmp 即可
+        img_a_path = self.img_a_dir / f"{name_a}.bmp"
+        img_b_path = self.img_b_dir / f"{name_b}.bmp"
+        label_path = self.label_dir / f"{name_label}.bmp"
 
-        label_path = self.label_dir / f"{img_name}.png"
-        if not label_path.exists():
-            label_path = self.label_dir / f"{img_name}.jpg"
+        # 备用检查：如果不是bmp，尝试png (防止报错)
+        # 备用检查：按 bmp -> png -> jpg 依次找（也可以把顺序改成 jpg 优先）
+        if not img_a_path.exists(): img_a_path = self.img_a_dir / f"{name_a}.png"
+        if not img_a_path.exists(): img_a_path = self.img_a_dir / f"{name_a}.jpg"
 
-        # 加载图像
-        img_a = np.array(Image.open(img_a_path).convert('RGB'))
-        img_b = np.array(Image.open(img_b_path).convert('RGB'))
-        label = np.array(Image.open(label_path).convert('L'))
+        if not img_b_path.exists(): img_b_path = self.img_b_dir / f"{name_b}.png"
+        if not img_b_path.exists(): img_b_path = self.img_b_dir / f"{name_b}.jpg"
+
+        if not label_path.exists(): label_path = self.label_dir / f"{name_label}.png"
+        if not label_path.exists(): label_path = self.label_dir / f"{name_label}.jpg"
+
+        # --- 加载图像 (保持不变) ---
+        try:
+            img_a = np.array(Image.open(img_a_path).convert('RGB'))
+            img_b = np.array(Image.open(img_b_path).convert('RGB'))
+            label = np.array(Image.open(label_path).convert('L'))
+        except Exception as e:
+            print(f"Error loading: {img_a_path} or its pair")
+            raise e
 
         # 将标签二值化 (0: 无变化, 1: 有变化)
-        # LEVIR-CD标签: 白色(255)=变化, 黑色(0)=无变化
+        # 注意：有些数据集标签是0和255，有些是0和1，这里统一处理
         label = (label > 127).astype(np.uint8)
 
-        # 应用变换
+        # 应用变换 (保持不变)
         if self.transform:
-            # 将两张图像拼接以保证同步变换
-            # albumentations的additional_targets功能
             transformed = self.transform(
                 image=img_a,
                 image2=img_b,
@@ -108,7 +133,6 @@ class LEVIRCDDataset(Dataset):
             img_b = transformed['image2']
             label = transformed['mask']
         else:
-            # 默认转换为tensor
             img_a = torch.from_numpy(img_a).permute(2, 0, 1).float() / 255.0
             img_b = torch.from_numpy(img_b).permute(2, 0, 1).float() / 255.0
             label = torch.from_numpy(label).long()
@@ -117,7 +141,7 @@ class LEVIRCDDataset(Dataset):
             'img_a': img_a,
             'img_b': img_b,
             'label': label,
-            'name': img_name
+            'name': name_a  # 返回文件名方便调试
         }
 
 

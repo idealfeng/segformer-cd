@@ -1,15 +1,22 @@
 """
-SegFormer变化检测训练脚本
+SegFormer变化检测训练脚本 - 统一数据集版本
 
-运行:
-    python train.py                     # 完整训练
-    python train.py --epochs 50         # 自定义epoch
-    python train.py --resume best.pth   # 恢复训练
-    python train.py --batch-size 16     # 自定义batch size
+支持数据集: LEVIR-CD, S2Looking, WHUCD
+
+运行示例:
+    # LEVIR-CD
+    python train_unified.py --dataset levir --data-root "data/LEVIR-CD" --exp-name levir_only --epochs 50
+
+    # S2Looking
+    python train_unified.py --dataset s2looking --data-root "data/S2Looking" --exp-name s2looking_only --epochs 50
+
+    # WHUCD
+    python train_unified.py --dataset whucd --data-root "data/Building change detection dataset_add" --exp-name whucd_only --epochs 50
 """
 import os
+
 os.environ['ALBUMENTATIONS_CHECK_VERSION'] = 'False'
-from models.simple_cd import build_simple_model
+
 import argparse
 from pathlib import Path
 from tqdm import tqdm
@@ -23,11 +30,12 @@ import numpy as np
 from datetime import datetime
 
 from config import cfg
-from dataset import create_dataloaders
+from unified_dataset import create_dataloaders_unified  # ← 修改这里
 from models.segformer import build_model
 from losses.losses import build_criterion
 
 import logging
+
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 
@@ -77,15 +85,18 @@ class Trainer:
         self.args = args
         self.device = torch.device(cfg.DEVICE)
 
+        # ← 新增：保存数据集信息
+        self.dataset_name = args.dataset
+
         # 设置随机种子
         set_seed(cfg.SEED)
 
-        # 创建输出目录
+        # 创建输出目录（使用exp_name）
         self.setup_dirs()
 
         # 初始化组件
         print("=" * 60)
-        print("Initializing Change Detection Training...")
+        print(f"Initializing Training for {args.dataset.upper()}...")
         print("=" * 60)
 
         self.model = self.build_model()
@@ -100,7 +111,7 @@ class Trainer:
 
         # TensorBoard
         if cfg.USE_TENSORBOARD:
-            self.writer = SummaryWriter(log_dir=str(cfg.LOG_DIR / datetime.now().strftime('%Y%m%d_%H%M%S')))
+            self.writer = SummaryWriter(log_dir=str(self.log_dir))
         else:
             self.writer = None
 
@@ -117,58 +128,37 @@ class Trainer:
         self.print_info()
 
     def setup_dirs(self):
-        """创建输出目录"""
-        cfg.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        cfg.LOG_DIR.mkdir(parents=True, exist_ok=True)
-        cfg.VIS_DIR.mkdir(parents=True, exist_ok=True)
-        cfg.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        """创建输出目录（基于exp_name）"""
+        # 使用实验名称创建独立目录
+        self.exp_dir = Path('outputs') / self.args.exp_name
+        self.checkpoint_dir = self.exp_dir / 'checkpoints'
+        self.log_dir = self.exp_dir / 'logs'
+        self.results_dir = self.exp_dir / 'results'
+
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Experiment directory: {self.exp_dir}")
 
     def build_model(self):
         """构建模型"""
-        # 根据命令行参数选择模型
-
-        if hasattr(self.args, 'model') and self.args.model == 'simple':
-
-            # 使用简单的ResNet模型
-
-            print("Using Simple ResNet18 Siamese Model")
-
-            model = build_simple_model(
-
-                backbone='resnet18',
-
-                pretrained=cfg.PRETRAINED,
-
-                num_classes=cfg.NUM_CLASSES
-
-            )
-
-        else:
-
-            # 使用SegFormer模型（默认）
-
-            print("Using SegFormer Model")
-
-            variant = cfg.MODEL_TYPE.split('_')[-1]  # e.g., "segformer_b1" -> "b1"
-
-            model = build_model(
-
-                variant=variant,
-
-                pretrained=cfg.PRETRAINED,
-
-                num_classes=cfg.NUM_CLASSES
-
-            )
-
+        variant = cfg.MODEL_TYPE.split('_')[-1]  # e.g., "segformer_b1" -> "b1"
+        model = build_model(
+            variant=variant,
+            pretrained=cfg.PRETRAINED,
+            num_classes=cfg.NUM_CLASSES
+        )
         model = model.to(self.device)
-
         return model
 
     def build_dataloaders(self):
-        """构建数据加载器"""
-        train_loader, val_loader, test_loader = create_dataloaders(
-            batch_size=cfg.BATCH_SIZE,
+        """构建数据加载器（统一接口）"""
+        # ← 修改：使用unified接口
+        train_loader, val_loader, test_loader = create_dataloaders_unified(
+            dataset_name=self.args.dataset,
+            data_root=Path(self.args.data_root),
+            batch_size=self.args.batch_size,
             num_workers=cfg.NUM_WORKERS,
             crop_size=cfg.CROP_SIZE
         )
@@ -179,14 +169,14 @@ class Trainer:
         if cfg.OPTIMIZER == 'adamw':
             optimizer = torch.optim.AdamW(
                 self.model.parameters(),
-                lr=cfg.LEARNING_RATE,
+                lr=self.args.lr,
                 weight_decay=cfg.WEIGHT_DECAY,
                 betas=cfg.BETAS
             )
         elif cfg.OPTIMIZER == 'sgd':
             optimizer = torch.optim.SGD(
                 self.model.parameters(),
-                lr=cfg.LEARNING_RATE,
+                lr=self.args.lr,
                 momentum=0.9,
                 weight_decay=cfg.WEIGHT_DECAY
             )
@@ -201,16 +191,16 @@ class Trainer:
             def lr_lambda(epoch):
                 if epoch < cfg.WARMUP_EPOCHS:
                     # Warmup
-                    return cfg.WARMUP_LR / cfg.LEARNING_RATE + \
-                           (1 - cfg.WARMUP_LR / cfg.LEARNING_RATE) * epoch / cfg.WARMUP_EPOCHS
+                    return cfg.WARMUP_LR / self.args.lr + \
+                        (1 - cfg.WARMUP_LR / self.args.lr) * epoch / cfg.WARMUP_EPOCHS
                 else:
                     # Polynomial decay
-                    return (1 - (epoch - cfg.WARMUP_EPOCHS) / (cfg.NUM_EPOCHS - cfg.WARMUP_EPOCHS)) ** cfg.LR_POWER
+                    return (1 - (epoch - cfg.WARMUP_EPOCHS) / (self.args.epochs - cfg.WARMUP_EPOCHS)) ** cfg.LR_POWER
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         elif cfg.LR_SCHEDULER == 'cosine':
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=cfg.NUM_EPOCHS, eta_min=cfg.MIN_LR
+                self.optimizer, T_max=self.args.epochs, eta_min=cfg.MIN_LR
             )
         else:
             scheduler = torch.optim.lr_scheduler.StepLR(
@@ -221,16 +211,17 @@ class Trainer:
     def print_info(self):
         """打印训练信息"""
         print(f"\nTraining Configuration:")
+        print(f"  Dataset: {self.dataset_name.upper()}")
         print(f"  Model: {cfg.MODEL_TYPE}")
         print(f"  Device: {self.device}")
         print(f"  Train samples: {len(self.train_loader.dataset)}")
         print(f"  Val samples: {len(self.val_loader.dataset)}")
         print(f"  Test samples: {len(self.test_loader.dataset)}")
-        print(f"  Batch size: {cfg.BATCH_SIZE}")
+        print(f"  Batch size: {self.args.batch_size}")
         print(f"  Gradient accumulation: {cfg.GRADIENT_ACCUMULATION_STEPS}")
-        print(f"  Effective batch size: {cfg.BATCH_SIZE * cfg.GRADIENT_ACCUMULATION_STEPS}")
-        print(f"  Epochs: {cfg.NUM_EPOCHS}")
-        print(f"  Learning rate: {cfg.LEARNING_RATE}")
+        print(f"  Effective batch size: {self.args.batch_size * cfg.GRADIENT_ACCUMULATION_STEPS}")
+        print(f"  Epochs: {self.args.epochs}")
+        print(f"  Learning rate: {self.args.lr}")
         print(f"  AMP: {self.use_amp}")
         print("=" * 60)
 
@@ -243,7 +234,7 @@ class Trainer:
         all_metrics = {'precision': 0, 'recall': 0, 'f1': 0, 'iou': 0, 'oa': 0}
         num_batches = len(self.train_loader)
 
-        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{cfg.NUM_EPOCHS}')
+        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.args.epochs}')
 
         self.optimizer.zero_grad()
 
@@ -350,6 +341,7 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_metric': self.best_metric,
             'best_epoch': self.best_epoch,
+            'dataset': self.dataset_name,  # ← 保存数据集信息
             'config': {
                 'model_type': cfg.MODEL_TYPE,
                 'num_classes': cfg.NUM_CLASSES,
@@ -361,17 +353,17 @@ class Trainer:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
 
         # 保存最新检查点
-        checkpoint_path = cfg.CHECKPOINT_DIR / f'checkpoint_epoch_{epoch}.pth'
+        checkpoint_path = self.checkpoint_dir / f'epoch_{epoch}.pth'
         torch.save(checkpoint, checkpoint_path)
 
         # 保存最佳检查点
         if is_best:
-            best_path = cfg.CHECKPOINT_DIR / 'best_model.pth'
+            best_path = self.checkpoint_dir / 'best.pth'
             torch.save(checkpoint, best_path)
-            print(f"  Saved best model (F1: {self.best_metric:.4f})")
+            print(f"  ✓ Saved best model (F1: {self.best_metric:.4f})")
 
         # 清理旧检查点（保留最新5个）
-        checkpoints = sorted(cfg.CHECKPOINT_DIR.glob('checkpoint_epoch_*.pth'))
+        checkpoints = sorted(self.checkpoint_dir.glob('epoch_*.pth'))
         if len(checkpoints) > 5:
             for old_ckpt in checkpoints[:-5]:
                 old_ckpt.unlink()
@@ -388,17 +380,28 @@ class Trainer:
         if self.scaler is not None and 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
-        self.start_epoch = checkpoint['epoch'] + 1
-        self.best_metric = checkpoint.get('best_metric', 0.0)
-        self.best_epoch = checkpoint.get('best_epoch', 0)
+        # ← 新增：根据参数决定是否重置
+        if self.args.reset_epoch:
+            self.start_epoch = 0
+            print("  ✓ Epoch counter reset to 0")
+        else:
+            self.start_epoch = checkpoint['epoch'] + 1
 
-        print(f"Resumed from epoch {self.start_epoch}, best F1: {self.best_metric:.4f}")
+        if self.args.reset_best:
+            self.best_metric = 0.0
+            self.best_epoch = 0
+            print("  ✓ Best metric reset to 0.0")
+        else:
+            self.best_metric = checkpoint.get('best_metric', 0.0)
+            self.best_epoch = checkpoint.get('best_epoch', 0)
 
+        print(f"  Start epoch: {self.start_epoch}")
+        print(f"  Best F1 threshold: {self.best_metric:.4f}")
     def train(self):
         """主训练循环"""
         print("\nStarting training...")
 
-        for epoch in range(self.start_epoch, cfg.NUM_EPOCHS):
+        for epoch in range(self.start_epoch, self.args.epochs):
             # 训练
             train_loss, train_metrics = self.train_epoch(epoch + 1)
 
@@ -407,7 +410,7 @@ class Trainer:
             current_lr = self.scheduler.get_last_lr()[0]
 
             # 打印训练结果
-            print(f"\nEpoch {epoch + 1}/{cfg.NUM_EPOCHS}")
+            print(f"\nEpoch {epoch + 1}/{self.args.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
             print(f"  Train F1: {train_metrics['f1']:.4f}, IoU: {train_metrics['iou']:.4f}")
             print(f"  Learning Rate: {current_lr:.6f}")
@@ -421,7 +424,7 @@ class Trainer:
                 print(f"  Val Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}")
 
                 # 检查是否是最佳模型
-                current_metric = val_metrics[cfg.BEST_METRIC.lower()]
+                current_metric = val_metrics['f1']  # 固定用F1
                 is_best = current_metric > self.best_metric
 
                 if is_best:
@@ -456,36 +459,70 @@ class Trainer:
         print(f"Best F1: {self.best_metric:.4f} at epoch {self.best_epoch}")
         print("=" * 60)
 
-        # 保存最终模型
-        self.save_checkpoint(cfg.NUM_EPOCHS, is_best=False)
+        # 保存最终结果
+        self.save_final_results()
 
         if self.writer:
             self.writer.close()
 
+    def save_final_results(self):
+        """保存最终结果"""
+        results = {
+            'dataset': self.dataset_name,
+            'best_f1': self.best_metric,
+            'best_epoch': self.best_epoch,
+            'exp_name': self.args.exp_name
+        }
+
+        with open(self.results_dir / 'results.json', 'w') as f:
+            json.dump(results, f, indent=2)
+
 
 def main():
-    parser = argparse.ArgumentParser(description='SegFormer Change Detection Training')
-    parser.add_argument('--model', type=str, default='segformer', choices=['segformer', 'simple'],help='Model type: segformer (default) or simple (ResNet18)')
-    parser.add_argument('--epochs', type=int, default=None, help='Number of epochs')
-    parser.add_argument('--batch-size', type=int, default=None, help='Batch size')
-    parser.add_argument('--lr', type=float, default=None, help='Learning rate')
-    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
-    parser.add_argument('--no-amp', action='store_true', help='Disable AMP')
+    parser = argparse.ArgumentParser(description='Unified Change Detection Training')
+
+    # 必需参数
+    parser.add_argument('--dataset', type=str, required=True,
+                        choices=['levir', 's2looking', 'whucd'],
+                        help='Dataset name')
+    parser.add_argument('--data-root', type=str, required=True,
+                        help='Path to dataset root directory')
+    parser.add_argument('--exp-name', type=str, required=True,
+                        help='Experiment name (for saving outputs)')
+
+    # 可选参数
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='Number of epochs (default: 50)')
+    parser.add_argument('--batch-size', type=int, default=8,
+                        help='Batch size (default: 8)')
+    parser.add_argument('--lr', type=float, default=5e-4,
+                        help='Learning rate (default: 5e-4)')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Resume from checkpoint')
+    parser.add_argument('--reset-best', action='store_true',  # ← 新增
+                       help='Reset best metric when resuming (for cross-dataset fine-tuning)')
+    parser.add_argument('--reset-epoch', action='store_true',  # ← 新增
+                       help='Reset epoch counter when resuming')
+    parser.add_argument('--no-amp', action='store_true',
+                        help='Disable AMP')
 
     args = parser.parse_args()
 
-    # 更新配置
-    if args.epochs:
-        cfg.NUM_EPOCHS = args.epochs
-    if args.batch_size:
-        cfg.BATCH_SIZE = args.batch_size
-    if args.lr:
-        cfg.LEARNING_RATE = args.lr
+    # 更新配置（如果需要）
     if args.no_amp:
         cfg.USE_AMP = False
 
     # 显示配置
-    cfg.display()
+    print("=" * 60)
+    print(f"Unified Change Detection Training")
+    print("=" * 60)
+    print(f"Dataset: {args.dataset.upper()}")
+    print(f"Data Root: {args.data_root}")
+    print(f"Experiment: {args.exp_name}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Batch Size: {args.batch_size}")
+    print(f"Learning Rate: {args.lr}")
+    print("=" * 60)
 
     # 创建训练器并开始训练
     trainer = Trainer(args)

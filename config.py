@@ -13,7 +13,7 @@ class Config:
     PROJECT_ROOT = Path(__file__).parent.resolve()
 
     # 数据路径 - LEVIR-CD数据集
-    DATA_ROOT = PROJECT_ROOT / "data" / "LEVIR-CD"
+    DATA_ROOT = PROJECT_ROOT / "data/ChangeDetectionDataset/Real/subset"
     TRAIN_DIR = DATA_ROOT / "train"
     VAL_DIR = DATA_ROOT / "val"
     TEST_DIR = DATA_ROOT / "test"
@@ -63,9 +63,9 @@ class Config:
     DEEP_SUPERVISION = True
     DEEP_SUPERVISION_WEIGHTS = [1.0, 0.4, 0.2, 0.1]  # 各尺度权重
 
-    # 语义引导模块（正交设计：不改变特征，只生成引导置信图）
-    USE_SEMANTIC_GUIDANCE = True
-    GUIDANCE_HIGH_LEVEL_ONLY = True  # 仅在高层（Stage 3-4）生成语义引导
+    # # 语义引导模块（正交设计：不改变特征，只生成引导置信图）
+    # USE_SEMANTIC_GUIDANCE = True
+    # GUIDANCE_HIGH_LEVEL_ONLY = False  # 仅在高层（Stage 3-4）生成语义引导
 
     # ==================== 训练配置 ====================
     # 基础训练参数
@@ -141,7 +141,7 @@ class Config:
     VAL_FREQ = 1    # 每个epoch验证一次
 
     # 早停
-    EARLY_STOPPING = True
+    EARLY_STOPPING = False
     PATIENCE = 30  # 30个epoch不提升则停止
 
     # 评估指标

@@ -1,135 +1,58 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-import matplotlib.pyplot as plt
-from matplotlib import rcParams
+# check_whucd_structure.py
 
-import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from matplotlib import rcParams
+from pathlib import Path
 
-import numpy as np
-import plotly.graph_objects as go
+root = Path(r"D:\Paper\project\data\Building change detection dataset_add")
 
-import numpy as np
-import plotly.graph_objects as go
+print("="*60)
+print("WHUCD Dataset Structure Analysis")
+print("="*60)
 
-# 定义6个顶点
-# z=1 时的三角形底面
-v0 = [0, 0, 1]
-v1 = [0, 1, 1]
-v2 = [1, 1, 1]
+# 检查2012 train图像
+path_2012_train_img = root / "1. The two-period image data" / "2012" / "splited_images" / "train" / "image"
+print(f"\n2012 Train Images:")
+print(f"  Path exists: {path_2012_train_img.exists()}")
+if path_2012_train_img.exists():
+    files = list(path_2012_train_img.glob("*"))
+    print(f"  Total files: {len(files)}")
+    if files:
+        print(f"  First 3 files:")
+        for f in files[:3]:
+            print(f"    - {f.name} ({f.suffix})")
 
-# z=2 时的三角形顶面
-v3 = [0, 0, 2]
-v4 = [0, 2, 2]
-v5 = [2, 2, 2]
+# 检查2016 train图像
+path_2016_train_img = root / "1. The two-period image data" / "2016" / "splited_images" / "train" / "image"
+print(f"\n2016 Train Images:")
+print(f"  Path exists: {path_2016_train_img.exists()}")
+if path_2016_train_img.exists():
+    files = list(path_2016_train_img.glob("*"))
+    print(f"  Total files: {len(files)}")
+    if files:
+        print(f"  First 3 files:")
+        for f in files[:3]:
+            print(f"    - {f.name} ({f.suffix})")
 
-vertices = np.array([v0, v1, v2, v3, v4, v5])
+# 检查change_label
+path_label = root / "change_label" / "train"
+print(f"\nChange Label (train):")
+print(f"  Path exists: {path_label.exists()}")
+if path_label.exists():
+    files = list(path_label.glob("*"))
+    print(f"  Total files: {len(files)}")
+    for f in files:
+        print(f"    - {f.name} ({f.suffix}, {f.stat().st_size / 1024 / 1024:.2f} MB)")
 
-# 定义8个三角形面（组成这个楔形体）
-# 底面 (z=1)
-# 顶面 (z=2)
-# 三个侧面
-faces = [
-    # 底面 (z=1)
-    [0, 1, 2],
+# 检查test集
+path_2012_test_img = root / "1. The two-period image data" / "2012" / "splited_images" / "test" / "image"
+print(f"\n2012 Test Images:")
+print(f"  Path exists: {path_2012_test_img.exists()}")
+if path_2012_test_img.exists():
+    files = list(path_2012_test_img.glob("*"))
+    print(f"  Total files: {len(files)}")
 
-    # 顶面 (z=2)
-    [3, 4, 5],
+# 检查是否有val集
+path_2012_val_img = root / "1. The two-period image data" / "2012" / "splited_images" / "val" / "image"
+print(f"\n2012 Val Images:")
+print(f"  Path exists: {path_2012_val_img.exists()}")
 
-    # 侧面1: x=0 平面 (四边形，分成两个三角形)
-    [0, 1, 4],
-    [0, 4, 3],
-
-    # 侧面2: x=y 平面 (四边形，分成两个三角形)
-    [1, 2, 5],
-    [1, 5, 4],
-
-    # 侧面3: y=z 平面 (四边形，分成两个三角形)
-    [0, 2, 5],
-    [0, 5, 3]
-]
-
-# 创建网格数据
-i = [face[0] for face in faces]
-j = [face[1] for face in faces]
-k = [face[2] for face in faces]
-
-# 创建3D网格
-fig = go.Figure(data=[
-    go.Mesh3d(
-        x=vertices[:, 0],
-        y=vertices[:, 1],
-        z=vertices[:, 2],
-        i=i, j=j, k=k,
-        opacity=0.7,
-        color='cyan',
-        flatshading=True,
-        name='楔形区域'
-    )
-])
-
-# 添加顶点
-labels = [
-    '(0,0,1)', '(0,1,1)', '(1,1,1)',
-    '(0,0,2)', '(0,2,2)', '(2,2,2)'
-]
-
-fig.add_trace(go.Scatter3d(
-    x=vertices[:, 0],
-    y=vertices[:, 1],
-    z=vertices[:, 2],
-    mode='markers+text',
-    marker=dict(size=8, color='red', line=dict(color='black', width=2)),
-    text=labels,
-    textposition='top center',
-    textfont=dict(size=12, color='black'),
-    name='顶点'
-))
-
-# 添加所有边
-edges = [
-    # 底面边
-    [0, 1], [1, 2], [2, 0],
-    # 顶面边
-    [3, 4], [4, 5], [5, 3],
-    # 竖直边
-    [0, 3], [1, 4], [2, 5]
-]
-
-for edge in edges:
-    fig.add_trace(go.Scatter3d(
-        x=[vertices[edge[0], 0], vertices[edge[1], 0]],
-        y=[vertices[edge[0], 1], vertices[edge[1], 1]],
-        z=[vertices[edge[0], 2], vertices[edge[1], 2]],
-        mode='lines',
-        line=dict(color='darkblue', width=3),
-        showlegend=False
-    ))
-
-# 设置布局
-fig.update_layout(
-    title=dict(
-        text='空间区域: 0≤x≤y≤z, 1≤z≤2 (三棱柱/楔形体)<br><sub>鼠标拖动旋转 | 滚轮缩放</sub>',
-        x=0.5,
-        xanchor='center',
-        font=dict(size=18)
-    ),
-    scene=dict(
-        xaxis=dict(title='X', range=[-0.5, 2.5]),
-        yaxis=dict(title='Y', range=[-0.5, 2.5]),
-        zaxis=dict(title='Z', range=[0.5, 2.5]),
-        aspectmode='cube',
-        camera=dict(
-            eye=dict(x=1.5, y=-1.5, z=1.2)
-        )
-    ),
-    width=1200,
-    height=900,
-    showlegend=True
-)
-
-fig.show()
+print("\n" + "="*60)
