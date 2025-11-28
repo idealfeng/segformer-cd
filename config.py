@@ -67,7 +67,7 @@ class Config:
     # ==================== 训练配置 ====================
     # 基础训练参数
     BATCH_SIZE = 8  # 4060 8G显存，256x256图像
-    NUM_EPOCHS = 200
+    NUM_EPOCHS = 300  # 实验发现300 epochs优于200 epochs
     NUM_WORKERS = 4
 
     # 梯度累积（等效batch_size = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS）
