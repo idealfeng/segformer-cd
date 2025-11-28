@@ -183,8 +183,6 @@ class SegFormerCD(nn.Module):
             self.aux_heads = None
 
         # 只初始化新增模块，不要动预训练的encoder！
-        if self.semantic_guides is not None:
-            self.semantic_guides.apply(self._init_weights)
         self.diff_modules.apply(self._init_weights)
         self.decoder.apply(self._init_weights)
         self.classifier.apply(self._init_weights)
