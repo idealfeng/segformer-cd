@@ -2,6 +2,11 @@
 Unified evaluation + dump for Change Detection (SegFormer baseline)
 
 python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset levir --data-root data\LEVIR-CD --exp-name levir2levir --window 256 --stride 256 --num-vis 10
+python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset whucd --data-root data\WHUCD --exp-name levir2whu --window 256 --stride 256 --num-vis 10
+python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset whucd --data-root data\WHUCD --exp-name whu2whu --window 256 --stride 256 --num-vis 10
+python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset levir --data-root data\LEVIR-CD --exp-name whu2levir --window 256 --stride 256 --num-vis 10
+
+python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset levir --data-root data\LEVIR-CD --exp-name levir2levir_autoThr --window 256 --stride 256 --auto-threshold --auto-bins 512 --num-vis 10 --no-dump-all
 
 Run examples:
   # levir->levir
@@ -139,6 +144,7 @@ def _find_file(dir_path: Path, stem: str) -> Path:
         return cand[0]
     raise FileNotFoundError(f"Cannot find file for stem={stem} in {dir_path}")
 
+
 class PairCDDataset(Dataset):
     def __init__(self, root_dir: str, split: str = "test"):
         self.root_dir = Path(root_dir)
@@ -147,12 +153,25 @@ class PairCDDataset(Dataset):
         if not split_dir.exists():
             raise FileNotFoundError(f"Split dir not found: {split_dir}")
 
-        # common aliases
-        self.dir_a = _resolve_subdir(split_dir, ["A", "imageA", "t1", "T1", "img1", "images1"])
-        self.dir_b = _resolve_subdir(split_dir, ["B", "imageB", "t2", "T2", "img2", "images2"])
-        self.dir_l = _resolve_subdir(split_dir, ["label", "labels", "gt", "GT", "mask", "masks"])
+        self.dir_a = _resolve_subdir(
+            split_dir, ["A", "imageA", "t1", "T1", "img1", "images1"]
+        )
+        self.dir_b = _resolve_subdir(
+            split_dir, ["B", "imageB", "t2", "T2", "img2", "images2"]
+        )
+        self.dir_l = _resolve_subdir(
+            split_dir, ["label", "labels", "gt", "GT", "mask", "masks"]
+        )
 
-        self.names = _list_stems(self.dir_a)
+        # ✅ 用交集，避免缺文件
+        stems_a = set(_list_stems(self.dir_a))
+        stems_b = set(_list_stems(self.dir_b))
+        stems_l = set(_list_stems(self.dir_l))
+        self.names = sorted(list(stems_a & stems_b & stems_l))
+        if len(self.names) == 0:
+            raise RuntimeError(
+                f"No paired samples found under {split_dir} (check A/B/label names)."
+            )
 
     def __len__(self):
         return len(self.names)
@@ -167,8 +186,12 @@ class PairCDDataset(Dataset):
         img_b = np.array(Image.open(pb).convert("RGB"))
         lab = np.array(Image.open(pl).convert("L"))
 
-        # binarize labels (0/1)
-        lab01 = (lab > 127).astype(np.uint8)
+        # ✅ 鲁棒二值化：同时兼容 0/1、0/255、以及 jpg 脏值(254/1)
+        mx = int(lab.max())
+        if mx <= 1:
+            lab01 = (lab > 0).astype(np.uint8)
+        else:
+            lab01 = (lab >= 128).astype(np.uint8)  # 254/255 -> 1, 0/1 -> 0
 
         ta = to_tensor_norm(img_a)
         tb = to_tensor_norm(img_b)
@@ -203,7 +226,9 @@ class Evaluator:
         self.min_area = int(min_area)
 
         self.model = self._load_model(checkpoint_path).to(self.device).eval()
-        self.dataset = PairCDDataset(dataset_root, split="test")
+        self.dataset_root = Path(dataset_root)
+        self.dataset = PairCDDataset(str(self.dataset_root), split="test")
+
         self.loader = DataLoader(self.dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
 
     def _load_model(self, checkpoint_path: str):
@@ -264,6 +289,77 @@ class Evaluator:
         mask01 = (score01 > thr).astype(np.uint8)
         mask01 = filter_small_cc(mask01, min_area=self.min_area)
         return mask01, float(thr)
+    
+    def _build_loader(self, split: str):
+        ds = PairCDDataset(str(self.dataset.root_dir), split=split)
+        return DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
+
+    @torch.no_grad()
+    def _val_hist(self, split: str = "val", bins: int = 512):
+        """
+        用直方图累计 pos/neg 的 score 分布，从而快速扫阈值找最优 F1。
+        不需要把所有 score map 存到内存里，速度/内存都稳。
+        """
+        loader = self._build_loader(split)
+        hist_pos = np.zeros((bins,), dtype=np.int64)
+        hist_neg = np.zeros((bins,), dtype=np.int64)
+        total_pos = 0
+        total_neg = 0
+
+        for batch in loader:
+            img_a = batch["img_a"].to(self.device)
+            img_b = batch["img_b"].to(self.device)
+            gt = batch["label"].to(self.device).squeeze(0).detach().cpu().numpy().astype(np.uint8)  # (H,W)
+
+            prob = self.sliding_window_prob(img_a, img_b)  # (1,H,W)
+            score = prob.squeeze(0).detach().cpu().numpy().astype(np.float32)  # [0,1]
+
+            s = score.reshape(-1)
+            g = gt.reshape(-1)
+
+            pos = s[g == 1]
+            neg = s[g == 0]
+
+            total_pos += pos.size
+            total_neg += neg.size
+
+            # 直方图累计（固定分箱 0~1）
+            hp, _ = np.histogram(pos, bins=bins, range=(0.0, 1.0))
+            hn, _ = np.histogram(neg, bins=bins, range=(0.0, 1.0))
+            hist_pos += hp
+            hist_neg += hn
+
+        return hist_pos, hist_neg, total_pos, total_neg
+
+    @torch.no_grad()
+    def auto_select_threshold(self, bins: int = 512, split: str = "val"):
+        """
+        在 val 上寻找 best F1 的阈值（pred=score>=thr）。
+        """
+        hist_pos, hist_neg, total_pos, total_neg = self._val_hist(split=split, bins=bins)
+
+        # 从高到低累计：thr 越小，预测为 1 的像素越多
+        pos_cum = np.cumsum(hist_pos[::-1])[::-1].astype(np.float64)  # tp(thr_i)
+        neg_cum = np.cumsum(hist_neg[::-1])[::-1].astype(np.float64)  # fp(thr_i)
+
+        # 对应阈值（用 bin 的左边界近似）
+        edges = np.linspace(0.0, 1.0, bins + 1, dtype=np.float32)[:-1]  # len=bins
+
+        tp = pos_cum
+        fp = neg_cum
+        fn = float(total_pos) - tp
+
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+        best_i = int(np.nanargmax(f1))
+        best_thr = float(edges[best_i])
+        best_f1 = float(f1[best_i])
+        best_p = float(precision[best_i])
+        best_r = float(recall[best_i])
+
+        return best_thr, best_f1, best_p, best_r
 
     @torch.no_grad()
     def run(self, save_dir: Path, num_vis: int = 10, visualize_all: bool = False, dump_all: bool = True):
@@ -389,6 +485,9 @@ def main():
     ap.add_argument("--visualize-all", action="store_true")
     ap.add_argument("--no-dump-all", action="store_true", help="disable dumping score/mask for all samples")
 
+    ap.add_argument("--auto-threshold", action="store_true", help="select best threshold on val, then eval on test")
+    ap.add_argument("--auto-bins", type=int, default=512, help="bins for auto threshold search on val")
+
     args = ap.parse_args()
 
     save_dir = Path(args.out_dir) / args.exp_name
@@ -405,6 +504,16 @@ def main():
         meanstd_k=args.meanstd_k,
         min_area=args.min_area,
     )
+    if args.auto_threshold:
+        # Needs a val split under data-root/val
+        best_thr, best_f1, best_p, best_r = evaluator.auto_select_threshold(
+            bins=args.auto_bins, split="val"
+        )
+        evaluator.thresh_mode = "fixed"
+        evaluator.threshold = best_thr
+        print(
+            f"\n[AUTO-THR] best_thr={best_thr:.4f}  val_F1={best_f1:.4f}  val_P={best_p:.4f}  val_R={best_r:.4f}\n"
+        )
 
     res = evaluator.run(
         save_dir=save_dir,

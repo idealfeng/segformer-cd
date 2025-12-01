@@ -13,7 +13,7 @@ class Config:
     PROJECT_ROOT = Path(__file__).parent.resolve()
 
     # 数据路径 - LEVIR-CD数据集
-    DATA_ROOT = PROJECT_ROOT / "data/ChangeDetectionDataset/Real/subset"
+    DATA_ROOT = PROJECT_ROOT / "data/WHUCD"
     TRAIN_DIR = DATA_ROOT / "train"
     VAL_DIR = DATA_ROOT / "val"
     TEST_DIR = DATA_ROOT / "test"

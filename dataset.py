@@ -15,6 +15,39 @@ import random
 
 from config import cfg
 
+EXTS = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+
+
+def _find_existing(folder: Path, stem: str) -> Path:
+    for ext in EXTS:
+        p = folder / f"{stem}{ext}"
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"Missing file for stem={stem} under {folder}")
+
+
+def _read_rgb_any(path: Path) -> np.ndarray:
+    arr = np.array(Image.open(path))
+    # 16-bit tif -> 8-bit
+    if arr.dtype == np.uint16:
+        arr = (arr >> 8).astype(np.uint8)
+
+    # 保证3通道
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    if arr.shape[2] > 3:
+        arr = arr[:, :, :3]
+    return arr
+
+
+def _read_mask_any(path: Path) -> np.ndarray:
+    m = np.array(Image.open(path))
+    # 可能是 0/255 或 0/1 都统一成 0/1
+    if m.dtype == np.uint16:
+        m = (m >> 8).astype(np.uint8)
+    m = (m > 0).astype(np.uint8)
+    return m
+
 
 class LEVIRCDDataset(Dataset):
     """LEVIR-CD变化检测数据集"""
@@ -49,81 +82,35 @@ class LEVIRCDDataset(Dataset):
 
         print(f"[{split.upper()}] Loaded {len(self.img_names)} image pairs")
 
+
     def _get_image_names(self) -> List[str]:
-        """获取所有图像文件名"""
         if not self.img_a_dir.exists():
             raise FileNotFoundError(f"Directory not found: {self.img_a_dir}")
 
-        # 获取A目录下所有png文件
-        # 优先查找 bmp，因为你的截图显示是 bmp
-        img_names = sorted([
-            f.stem for f in self.img_a_dir.glob('*.bmp')
-        ])
-
-        # 如果没有bmp，再找找png或jpg作为备选
-        if len(img_names) == 0:
-            img_names = sorted([
-                f.stem for f in self.img_a_dir.glob('*.png')
-            ])
-
-        if len(img_names) == 0:
-            img_names = sorted([
-                f.stem for f in self.img_a_dir.glob('*.jpg')
-            ])
-
-        return img_names
+        stems = []
+        for ext in EXTS:
+            stems += [f.stem for f in self.img_a_dir.glob(f"*{ext}")]
+        stems = sorted(list(set(stems)))
+        return stems
 
     def __len__(self) -> int:
         return len(self.img_names)
 
     def __getitem__(self, idx: int) -> dict:
-        # img_name 这里拿到的是类似 "1_A" (不带后缀)
-        name_a = self.img_names[idx]
+        img_name = self.img_names[idx]
 
-        # --- 关键逻辑：处理文件名后缀不一致 ---
-        # 假设 A 中的文件名是 "1_A"，我们需要把 "_A" 换成 "_B" 去找 B图片
-        # 把 "_A" 换成 "_OUT" 去找标签
-        if name_a.endswith('_A'):
-            base_name = name_a[:-2]  # 去掉最后两个字符 "_A"
-            name_b = f"{base_name}_B"
-            name_label = f"{base_name}_OUT"
-        else:
-            # 如果文件名里没有 _A，则假设文件名一致
-            name_b = name_a
-            name_label = name_a
+        img_a_path = _find_existing(self.img_a_dir, img_name)
+        img_b_path = _find_existing(self.img_b_dir, img_name)
+        label_path = _find_existing(self.label_dir, img_name)
 
-        # 构建完整路径 (这里假设是 bmp，为了稳健可以保留之前的检测逻辑，但下面的写法更简洁)
-        # 如果你的数据全是 bmp，直接写 bmp 即可
-        img_a_path = self.img_a_dir / f"{name_a}.bmp"
-        img_b_path = self.img_b_dir / f"{name_b}.bmp"
-        label_path = self.label_dir / f"{name_label}.bmp"
+        img_a = _read_rgb_any(img_a_path)
+        img_b = _read_rgb_any(img_b_path)
+        label = _read_mask_any(label_path)
 
-        # 备用检查：如果不是bmp，尝试png (防止报错)
-        # 备用检查：按 bmp -> png -> jpg 依次找（也可以把顺序改成 jpg 优先）
-        if not img_a_path.exists(): img_a_path = self.img_a_dir / f"{name_a}.png"
-        if not img_a_path.exists(): img_a_path = self.img_a_dir / f"{name_a}.jpg"
-
-        if not img_b_path.exists(): img_b_path = self.img_b_dir / f"{name_b}.png"
-        if not img_b_path.exists(): img_b_path = self.img_b_dir / f"{name_b}.jpg"
-
-        if not label_path.exists(): label_path = self.label_dir / f"{name_label}.png"
-        if not label_path.exists(): label_path = self.label_dir / f"{name_label}.jpg"
-
-        # --- 加载图像 (保持不变) ---
-        try:
-            img_a = np.array(Image.open(img_a_path).convert('RGB'))
-            img_b = np.array(Image.open(img_b_path).convert('RGB'))
-            label = np.array(Image.open(label_path).convert('L'))
-        except Exception as e:
-            print(f"Error loading: {img_a_path} or its pair")
-            raise e
-
-        # 将标签二值化 (0: 无变化, 1: 有变化)
-        # 注意：有些数据集标签是0和255，有些是0和1，这里统一处理
-        label = (label > 127).astype(np.uint8)
-
-        # 应用变换 (保持不变)
+        # 应用变换
         if self.transform:
+            # 将两张图像拼接以保证同步变换
+            # albumentations的additional_targets功能
             transformed = self.transform(
                 image=img_a,
                 image2=img_b,
@@ -133,6 +120,7 @@ class LEVIRCDDataset(Dataset):
             img_b = transformed['image2']
             label = transformed['mask']
         else:
+            # 默认转换为tensor
             img_a = torch.from_numpy(img_a).permute(2, 0, 1).float() / 255.0
             img_b = torch.from_numpy(img_b).permute(2, 0, 1).float() / 255.0
             label = torch.from_numpy(label).long()
@@ -141,7 +129,7 @@ class LEVIRCDDataset(Dataset):
             'img_a': img_a,
             'img_b': img_b,
             'label': label,
-            'name': name_a  # 返回文件名方便调试
+            'name': img_name
         }
 
 
