@@ -13,7 +13,7 @@ class Config:
     PROJECT_ROOT = Path(__file__).parent.resolve()
 
     # 数据路径 - LEVIR-CD数据集
-    DATA_ROOT = PROJECT_ROOT / "data/WHUCD"
+    DATA_ROOT = PROJECT_ROOT / "data/LEVIR-CD"
     TRAIN_DIR = DATA_ROOT / "train"
     VAL_DIR = DATA_ROOT / "val"
     TEST_DIR = DATA_ROOT / "test"
@@ -67,7 +67,7 @@ class Config:
     # ==================== 训练配置 ====================
     # 基础训练参数
     BATCH_SIZE = 8  # 4060 8G显存，256x256图像
-    NUM_EPOCHS = 300  # 实验发现300 epochs优于200 epochs
+    NUM_EPOCHS = 200  # 实验发现300 epochs优于200 epochs
     NUM_WORKERS = 4
 
     # 梯度累积（等效batch_size = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS）

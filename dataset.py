@@ -75,7 +75,7 @@ class LEVIRCDDataset(Dataset):
         split_dir = self.root_dir / split
         self.img_a_dir = split_dir / 'A'
         self.img_b_dir = split_dir / 'B'
-        self.label_dir = split_dir / 'OUT'
+        self.label_dir = split_dir / 'label'
 
         # 获取所有图像文件名
         self.img_names = self._get_image_names()

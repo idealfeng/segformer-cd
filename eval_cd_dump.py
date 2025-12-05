@@ -231,16 +231,52 @@ class Evaluator:
 
         self.loader = DataLoader(self.dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
 
+
     def _load_model(self, checkpoint_path: str):
         ckpt = torch.load(checkpoint_path, map_location="cpu")
-        config = ckpt.get("config", {})
 
-        model_type = config.get("model_type", getattr(cfg, "MODEL_TYPE", "segformer_b0"))
-        num_classes = config.get("num_classes", getattr(cfg, "NUM_CLASSES", 1))
-        variant = model_type.split("_")[-1]
+        # 兼容不同保存格式
+        state = None
+        if "model_state_dict" in ckpt:
+            state = ckpt["model_state_dict"]
+        elif "model" in ckpt:
+            state = ckpt["model"]
+        elif "state_dict" in ckpt:
+            state = ckpt["state_dict"]
+        else:
+            raise KeyError(f"Unsupported checkpoint keys: {list(ckpt.keys())}")
+
+        # 读取配置（尽量从ckpt拿，拿不到就用cfg默认）
+        cfg_dict = ckpt.get("cfg", ckpt.get("config", {})) or {}
+
+        # 变体：优先命令行传入（你也可以后面加arg），其次从ckpt/cfg推断
+        model_type = cfg_dict.get("model_type", getattr(cfg, "MODEL_TYPE", "segformer_b1"))
+        # 兼容 "segformer_b1" / "b1" / "mit-b1" 等
+        if isinstance(model_type, str) and "b" in model_type:
+            variant = (
+                model_type.split("_")[-1].replace("mit-", "").replace("segformer-", "")
+            )
+        else:
+            variant = "b1"
+
+        num_classes = int(cfg_dict.get("num_classes", getattr(cfg, "NUM_CLASSES", 1)))
 
         model = build_model(variant=variant, pretrained=False, num_classes=num_classes)
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+
+        # 有些 ckpt 存的时候带 module. 前缀
+        new_state = {}
+        for k, v in state.items():
+            nk = k.replace("module.", "")
+            new_state[nk] = v
+
+        missing, unexpected = model.load_state_dict(new_state, strict=False)
+        print(f"[CKPT] loaded: {checkpoint_path}")
+        print(f"[CKPT] variant={variant} num_classes={num_classes}")
+        if missing:
+            print(f"[CKPT] missing keys: {len(missing)} (show 10) {missing[:10]}")
+        if unexpected:
+            print(f"[CKPT] unexpected keys: {len(unexpected)} (show 10) {unexpected[:10]}")
+
         return model
 
     @torch.no_grad()
@@ -289,7 +325,7 @@ class Evaluator:
         mask01 = (score01 > thr).astype(np.uint8)
         mask01 = filter_small_cc(mask01, min_area=self.min_area)
         return mask01, float(thr)
-    
+
     def _build_loader(self, split: str):
         ds = PairCDDataset(str(self.dataset.root_dir), split=split)
         return DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
