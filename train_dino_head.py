@@ -125,7 +125,7 @@ def main():
     ).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.startswith("cuda") and torch.cuda.is_available())
+    scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda") and torch.cuda.is_available())
     scheduler = build_scheduler(optimizer, cfg)
     best_f1 = -1.0
     start_ep = 1
@@ -139,7 +139,7 @@ def main():
                 scheduler.load_state_dict(ckpt["scheduler"])
             except Exception:
                 pass
-        if isinstance(scaler, torch.amp.GradScaler) and ckpt.get("scaler") is not None:
+        if isinstance(scaler, torch.cuda.amp.GradScaler) and ckpt.get("scaler") is not None:
             try:
                 scaler.load_state_dict(ckpt["scaler"])
             except Exception:
@@ -202,8 +202,8 @@ def main():
                         "epoch": ep,
                         "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                        "scaler": scaler.state_dict() if isinstance(scaler, torch.amp.GradScaler) else None,
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                    "scaler": scaler.state_dict() if isinstance(scaler, torch.cuda.amp.GradScaler) else None,
                         "best_f1": best_f1,
                         "cfg": asdict(cfg),
                     },
@@ -216,8 +216,8 @@ def main():
                         "epoch": ep,
                         "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                        "scaler": scaler.state_dict() if isinstance(scaler, torch.amp.GradScaler) else None,
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                    "scaler": scaler.state_dict() if isinstance(scaler, torch.cuda.amp.GradScaler) else None,
                         "best_f1": best_f1,
                         "cfg": asdict(cfg),
                     },

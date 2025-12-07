@@ -271,10 +271,7 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim
         elif label.ndim == 4 and label.shape[1] != 1:
             label = label[:, :1]
         label = label.float()
-        with torch.amp.autocast(
-            device_type="cuda",
-            enabled=(device.startswith("cuda") and torch.cuda.is_available()),
-        ):
+        with torch.cuda.amp.autocast(enabled=(device.startswith("cuda") and torch.cuda.is_available())):
             out = model(img_a, img_b)
             logits = out["pred"] if isinstance(out, dict) else out
             loss_bce = bce(logits, label)
