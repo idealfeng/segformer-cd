@@ -123,7 +123,7 @@ def main():
     ).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.startswith("cuda") and torch.cuda.is_available())
+    scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda") and torch.cuda.is_available())
     scheduler = build_scheduler(optimizer, cfg)
     best_f1 = -1.0
     best_path = os.path.join(cfg.out_dir, "best.pt")
