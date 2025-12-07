@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple
 
+try:
+    from transformers import AutoModel
+except Exception:
+    AutoModel = None  # only needed for DINOv3
+
 
 # -----------------------------
 # Normalization helper
@@ -13,7 +18,6 @@ def norm2d(norm: str, ch: int) -> nn.Module:
     if norm == "bn":
         return nn.BatchNorm2d(ch)
     elif norm == "gn":
-        # 32 groups is typical; fallback if ch < 32 or not divisible.
         g = 32
         while g > 1 and (ch % g != 0):
             g //= 2
@@ -23,7 +27,7 @@ def norm2d(norm: str, ch: int) -> nn.Module:
 
 
 class ChannelAttention(nn.Module):
-    """通道注意力（SE-style）"""
+    """Channel attention (SE-style)."""
 
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
@@ -45,7 +49,7 @@ class ChannelAttention(nn.Module):
 
 
 class DifferenceModule(nn.Module):
-    """|Fa-Fb| + (Fa+Fb) + 通道注意力"""
+    """|Fa-Fb| + (Fa+Fb) + channel attention."""
 
     def __init__(self, in_channels: int, out_channels: int, norm: str = "gn"):
         super().__init__()
@@ -68,7 +72,7 @@ class DifferenceModule(nn.Module):
 
 
 class MultiScaleFusionDecoder(nn.Module):
-    """多尺度融合解码器（类似 SegFormer MLPDecoder）"""
+    """Multi-scale fusion decoder (similar to SegFormer MLPDecoder)."""
 
     def __init__(
         self, in_channels_list: List[int], embed_dim: int = 256, norm: str = "gn"
@@ -103,11 +107,10 @@ class MultiScaleFusionDecoder(nn.Module):
 
 class DinoSiameseHead(nn.Module):
     """
-    改进版 DINOv2 头（稳定跨域版）：
-    - 修复 *_reg 模型的 register tokens
-    - 增加 1x1 adapter 降维（默认 192）避免 decoder 过重/过拟合
-    - 默认用 GroupNorm（小 batch 更稳），可切回 BN
-    - forward 返回 dict: {"pred": logits} 兼容你现有 evaluator
+    DINOv2 / DINOv3 siamese head for change detection.
+    - Supports DINOv2 (torch.hub) and DINOv3 (HF AutoModel).
+    - Adapter to reduce dim, GroupNorm by default.
+    - forward returns dict {"pred": logits}.
     """
 
     def __init__(
@@ -130,18 +133,33 @@ class DinoSiameseHead(nn.Module):
         self.adapter_dim = int(adapter_dim)
         self.norm = norm
 
-        self.backbone = torch.hub.load("facebookresearch/dinov2", dino_name)
-        self.backbone.eval()
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-
-        # number of register tokens for *_reg backbones (0 for non-reg)
-        self.num_reg = int(getattr(self.backbone, "num_register_tokens", 0))
-
-        with torch.no_grad():
-            dummy = torch.randn(1, 3, 224, 224)
-            out = self.backbone.forward_features(dummy)
-            self.feat_dim = out["x_norm_patchtokens"].shape[-1]
+        self.use_hf = "dinov3" in dino_name.lower() or dino_name.startswith(
+            "facebook/dinov3"
+        )
+        if self.use_hf:
+            if AutoModel is None:
+                raise ImportError(
+                    "transformers is required for DINOv3. Please install transformers>=4.56.0."
+                )
+            self.backbone = AutoModel.from_pretrained(
+                dino_name, trust_remote_code=True
+            )
+            self.backbone.eval()
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            self.num_reg = int(getattr(self.backbone.config, "num_register_tokens", 0) or 0)
+            self.patch = int(getattr(self.backbone.config, "patch_size", self.patch))
+            self.feat_dim = int(getattr(self.backbone.config, "hidden_size", 768))
+        else:
+            self.backbone = torch.hub.load("facebookresearch/dinov2", dino_name)
+            self.backbone.eval()
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            self.num_reg = int(getattr(self.backbone, "num_register_tokens", 0))
+            with torch.no_grad():
+                dummy = torch.randn(1, 3, 224, 224)
+                out = self.backbone.forward_features(dummy)
+                self.feat_dim = out["x_norm_patchtokens"].shape[-1]
 
         # adapters: feat_dim -> adapter_dim (per selected layer)
         self.adapters = nn.ModuleList(
@@ -194,48 +212,71 @@ class DinoSiameseHead(nn.Module):
         return x, (H, W)
 
     @torch.no_grad()
-    def _extract_multi_layer_features(
-        self, x: torch.Tensor
-    ) -> Tuple[List[torch.Tensor], Tuple[int, int], Tuple[int, int]]:
+    def _register_hooks_once(self):
+        if self.use_hf:
+            return
+        if hasattr(self, "_hooks") and self._hooks:
+            return
+        self._hook_feats: List[torch.Tensor] = []
+
+        def _make_hook():
+            def _hook(_, __, output):
+                self._hook_feats.append(output)
+
+            return _hook
+
+        self._hooks = []
+        for idx in self.selected_layers:
+            self._hooks.append(
+                self.backbone.blocks[idx - 1].register_forward_hook(_make_hook())
+            )
+
+    @torch.no_grad()
+    def _extract_pair_features(
+        self, img_a: torch.Tensor, img_b: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], Tuple[int, int], Tuple[int, int]]:
         """
-        Return: list of [B,C,h,w] for selected layers (same spatial resolution),
-                plus padded spatial size and original size for unpad.
+        Extract features for img_a/img_b in one forward (batch concat) to save time.
+        Return two lists of [B,C,h,w], padded size, and original size.
         """
+        x = torch.cat([img_a, img_b], dim=0)
         x, (H0, W0) = self._pad_to_patch_multiple(x)
-        B, _, Hp, Wp = x.shape
+        B2, _, Hp, Wp = x.shape
+        assert B2 % 2 == 0, "Batch should be even when concatenating A/B"
+        B = B2 // 2
         h, w = Hp // self.patch, Wp // self.patch
 
         feats_raw: List[torch.Tensor] = []
 
-        def hook_fn(_, __, output):
-            feats_raw.append(output)
-
-        hooks = []
-        # register hooks on blocks (1-indexed in selected_layers)
-        for idx in self.selected_layers:
-            hooks.append(self.backbone.blocks[idx - 1].register_forward_hook(hook_fn))
-
-        _ = self.backbone.forward_features(x)
-
-        for hk in hooks:
-            hk.remove()
-
-        if len(feats_raw) != len(self.selected_layers):
-            raise RuntimeError(
-                f"Expected {len(self.selected_layers)} hooks, got {len(feats_raw)}"
+        if self.use_hf:
+            out = self.backbone(
+                pixel_values=x, output_hidden_states=True, return_dict=True
             )
+            hidden_states = out.hidden_states
+            if hidden_states is None:
+                hidden_states = [out.last_hidden_state]
+            for idx in self.selected_layers:
+                real_idx = min(idx, len(hidden_states) - 1)
+                feats_raw.append(hidden_states[real_idx])
+        else:
+            self._hook_feats = []
+            self._register_hooks_once()
+            _ = self.backbone.forward_features(x)
+            feats_raw = self._hook_feats
+            if len(feats_raw) != len(self.selected_layers):
+                raise RuntimeError(
+                    f"Expected {len(self.selected_layers)} hooks, got {len(feats_raw)}"
+                )
 
-        feats: List[torch.Tensor] = []
+        feats_a: List[torch.Tensor] = []
+        feats_b: List[torch.Tensor] = []
         for feat in feats_raw:
-            # feat: [B, 1+num_reg+h*w, C] typically
             if feat.ndim != 3:
                 raise ValueError(f"Unexpected hooked feat shape: {feat.shape}")
-            # drop cls + reg tokens
-            tokens = feat[:, 1 + self.num_reg :, :]  # [B, Npatch, C]
-            # safety: keep last h*w tokens if mismatch (robust to weird packing)
+            tokens = feat[:, 1 + self.num_reg :, :]  # [2B, Npatch, C]
             if tokens.shape[1] != h * w:
                 tokens = tokens[:, -h * w :, :]
-            feat_map = tokens.transpose(1, 2).reshape(B, tokens.shape[-1], h, w)
+            feat_map = tokens.transpose(1, 2).reshape(B2, tokens.shape[-1], h, w)
             feat_map = F.normalize(feat_map, dim=1)
 
             if self.use_whiten:
@@ -243,18 +284,18 @@ class DinoSiameseHead(nn.Module):
                 sd = feat_map.std(dim=(2, 3), keepdim=True).clamp_min(1e-6)
                 feat_map = (feat_map - mu) / sd
 
-            feats.append(feat_map)
+            feats_a.append(feat_map[:B])
+            feats_b.append(feat_map[B:])
 
-        return feats, (Hp, Wp), (H0, W0)
+        return feats_a, feats_b, (Hp, Wp), (H0, W0)
 
     def forward(self, img_a: torch.Tensor, img_b: torch.Tensor):
         B, _, H, W = img_a.shape
 
         with torch.no_grad():
-            fa_list, (Hp, Wp), (H0, W0) = self._extract_multi_layer_features(img_a)
-            fb_list, (Hp2, Wp2), _ = self._extract_multi_layer_features(img_b)
-            if (Hp, Wp) != (Hp2, Wp2):
-                raise RuntimeError("Backbone outputs mismatch.")
+            fa_list, fb_list, (Hp, Wp), (H0, W0) = self._extract_pair_features(
+                img_a, img_b
+            )
 
         diff_feats = []
         for i, (fa, fb, dm) in enumerate(zip(fa_list, fb_list, self.diff_modules)):
@@ -266,7 +307,6 @@ class DinoSiameseHead(nn.Module):
         x = self.head(fused)  # [B, head_channels, h, w]
         logit_patch = self.classifier(x)  # [B, 1, h, w]
 
-        # upsample back to padded spatial size, then unpad, then ensure match original
         logit_pad = F.interpolate(
             logit_patch, size=(Hp, Wp), mode="bilinear", align_corners=False
         )

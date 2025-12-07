@@ -1,5 +1,5 @@
 """
-python train_dino_head.py --data_root data/LEVIR-CD --out_dir outputs/dino_head_cd --device auto --epochs 100 --batch_size 4 --crop_size 256 --bce_weight 0.5 --dice_weight 0.5 --thr_mode fixed --thr 0.5
+python train_dino_head.py --data_root data/LEVIR-CD --out_dir outputs/dino_head_cd --device auto --epochs 100 --batch_size 8 --crop_size 256 --bce_weight 0.5 --dice_weight 0.5 --thr_mode fixed --thr 0.5
 
 """
 
@@ -24,7 +24,7 @@ from dino_head_core import (
 )
 
 
-def parse_args() -> HeadCfg:
+def parse_args():
     base = HeadCfg()
     parser = argparse.ArgumentParser(description="Train DINOv2 change-detection head")
     parser.add_argument("--data_root", type=str, default=base.data_root)
@@ -66,6 +66,8 @@ def parse_args() -> HeadCfg:
     parser.add_argument("--save_last", dest="save_last", action="store_true")
     parser.add_argument("--no_save_last", dest="save_last", action="store_false")
     parser.set_defaults(save_last=base.save_last)
+    parser.add_argument("--resume", type=str, default=None, help="断点续训 ckpt 路径（last.pt/best.pt）")
+    parser.add_argument("--eval_every", type=int, default=1, help="每多少个 epoch 验证一次（默认每个 epoch）")
     args = parser.parse_args()
     device = args.device
     if device == "auto":
@@ -102,11 +104,11 @@ def parse_args() -> HeadCfg:
         vis_n=args.vis_n,
         log_every=args.log_every,
     )
-    return cfg
+    return cfg, args.resume, args.eval_every
 
 
 def main():
-    cfg = parse_args()
+    cfg, resume_ckpt, eval_every = parse_args()
     seed_everything(cfg.seed)
     device = cfg.device
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -126,6 +128,25 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=device.startswith("cuda") and torch.cuda.is_available())
     scheduler = build_scheduler(optimizer, cfg)
     best_f1 = -1.0
+    start_ep = 1
+    if resume_ckpt:
+        ckpt = torch.load(resume_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if scheduler is not None and ckpt.get("scheduler") is not None:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception:
+                pass
+        if isinstance(scaler, torch.amp.GradScaler) and ckpt.get("scaler") is not None:
+            try:
+                scaler.load_state_dict(ckpt["scaler"])
+            except Exception:
+                pass
+        best_f1 = ckpt.get("best_f1", best_f1)
+        start_ep = ckpt.get("epoch", 0) + 1
+        print(f"Resumed from {resume_ckpt}: start_ep={start_ep}, best_f1={best_f1:.4f}")
     best_path = os.path.join(cfg.out_dir, "best.pt")
     last_path = os.path.join(cfg.out_dir, "last.pt")
     metrics_path = os.path.join(cfg.out_dir, "metrics.jsonl")
@@ -139,7 +160,7 @@ def main():
     print(f"eval: full_eval={cfg.full_eval} thr_mode={cfg.thr_mode} thr={cfg.thr} topk={cfg.topk} smooth_k={cfg.smooth_k}")
     print(f"minarea: {cfg.use_minarea} (min_area={cfg.min_area})")
     print("==========================\n")
-    for ep in range(1, cfg.epochs + 1):
+    for ep in range(start_ep, cfg.epochs + 1):
         train_one_epoch(
             model=model,
             loader=train_loader,
@@ -151,40 +172,58 @@ def main():
             grad_accum=cfg.grad_accum,
             log_every=cfg.log_every,
         )
-        val_m = evaluate(
-            model=model,
-            loader=val_loader,
-            device=device,
-            thr_mode=cfg.thr_mode,
-            thr=cfg.thr,
-            topk=cfg.topk,
-            smooth_k=cfg.smooth_k,
-            use_minarea=cfg.use_minarea,
-            min_area=cfg.min_area,
-            print_every=0,
-            window=cfg.eval_window,
-            stride=cfg.eval_stride,
-        )
-        print(
-            f"[Epoch {ep:03d}] VAL  "
-            f"P={val_m['precision']:.4f} R={val_m['recall']:.4f} F1={val_m['f1']:.4f} "
-            f"IoU={val_m['iou']:.4f} OA={val_m['oa']:.4f} Kappa={val_m['kappa']:.4f} | "
-            f"TP={val_m['TP']} FP={val_m['FP']} FN={val_m['FN']} TN={val_m['TN']}"
-        )
-        with open(metrics_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"epoch": ep, "split": "val", **val_m, "time": time.time()}, ensure_ascii=False) + "\n")
-        if cfg.save_last:
-            torch.save(
-                {"epoch": ep, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "best_f1": best_f1, "cfg": asdict(cfg)},
-                last_path,
+        do_eval = (ep % eval_every == 0) or (ep == cfg.epochs)
+        if do_eval:
+            val_m = evaluate(
+                model=model,
+                loader=val_loader,
+                device=device,
+                thr_mode=cfg.thr_mode,
+                thr=cfg.thr,
+                topk=cfg.topk,
+                smooth_k=cfg.smooth_k,
+                use_minarea=cfg.use_minarea,
+                min_area=cfg.min_area,
+                print_every=0,
+                window=cfg.eval_window,
+                stride=cfg.eval_stride,
             )
-        if cfg.save_best and val_m["f1"] > best_f1:
-            best_f1 = val_m["f1"]
-            torch.save(
-                {"epoch": ep, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "best_f1": best_f1, "cfg": asdict(cfg)},
-                best_path,
+            print(
+                f"[Epoch {ep:03d}] VAL  "
+                f"P={val_m['precision']:.4f} R={val_m['recall']:.4f} F1={val_m['f1']:.4f} "
+                f"IoU={val_m['iou']:.4f} OA={val_m['oa']:.4f} Kappa={val_m['kappa']:.4f} | "
+                f"TP={val_m['TP']} FP={val_m['FP']} FN={val_m['FN']} TN={val_m['TN']}"
             )
-            print(f"  -> Saved BEST {best_path} (best_f1={best_f1:.4f})")
+            with open(metrics_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"epoch": ep, "split": "val", **val_m, "time": time.time()}, ensure_ascii=False) + "\n")
+            if cfg.save_last:
+                torch.save(
+                    {
+                        "epoch": ep,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                        "scaler": scaler.state_dict() if isinstance(scaler, torch.amp.GradScaler) else None,
+                        "best_f1": best_f1,
+                        "cfg": asdict(cfg),
+                    },
+                    last_path,
+                )
+            if cfg.save_best and val_m["f1"] > best_f1:
+                best_f1 = val_m["f1"]
+                torch.save(
+                    {
+                        "epoch": ep,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                        "scaler": scaler.state_dict() if isinstance(scaler, torch.amp.GradScaler) else None,
+                        "best_f1": best_f1,
+                        "cfg": asdict(cfg),
+                    },
+                    best_path,
+                )
+                print(f"  -> Saved BEST {best_path} (best_f1={best_f1:.4f})")
         if scheduler is not None:
             scheduler.step()
         if cfg.vis_every > 0 and (ep % cfg.vis_every == 0):

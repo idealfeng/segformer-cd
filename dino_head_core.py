@@ -173,7 +173,7 @@ class HeadCfg:
     min_area: int = 256
 
     # model
-    dino_name: str = "dinov2_vits14_reg"
+    dino_name: str = "dinov2_vitb14_reg"
     fuse_mode: str = "abs+sum"
     use_whiten: bool = False
 
