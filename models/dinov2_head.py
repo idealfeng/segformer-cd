@@ -115,7 +115,7 @@ class DinoSiameseHead(nn.Module):
 
     def __init__(
         self,
-        dino_name: str = "dinov2_vits14_reg",
+        dino_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
         patch: int = 14,
         use_whiten: bool = False,
         embed_dim: int = 256,
@@ -125,6 +125,9 @@ class DinoSiameseHead(nn.Module):
         selected_layers: Tuple[int, ...] = (3, 6, 9, 12),
         adapter_dim: int = 192,
         norm: str = "gn",  # "gn" (recommended) or "bn"
+        feat_smooth: bool = True,
+        feat_smooth_kernel: int = 3,
+        feat_smooth_tau: float = 1.0,
     ):
         super().__init__()
         self.patch = int(patch)
@@ -132,6 +135,9 @@ class DinoSiameseHead(nn.Module):
         self.selected_layers = list(selected_layers)
         self.adapter_dim = int(adapter_dim)
         self.norm = norm
+        self.feat_smooth = bool(feat_smooth)
+        self.feat_smooth_kernel = int(max(1, feat_smooth_kernel))
+        self.feat_smooth_tau = float(max(1e-6, feat_smooth_tau))
 
         self.use_hf = "dinov3" in dino_name.lower() or dino_name.startswith(
             "facebook/dinov3"
@@ -197,6 +203,18 @@ class DinoSiameseHead(nn.Module):
 
         self.head = nn.Sequential(*head_layers)
         self.classifier = nn.Conv2d(head_channels, 1, 1)
+
+    def _smooth_feat(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Neighborhood consistency smoothing to suppress outlier patches.
+        """
+        if not self.feat_smooth or self.feat_smooth_kernel <= 1:
+            return x
+        k = self.feat_smooth_kernel
+        mean = F.avg_pool2d(x, kernel_size=k, stride=1, padding=k // 2)
+        dev = (x - mean).abs().mean(dim=1, keepdim=True)  # [B,1,h,w]
+        w = torch.exp(-dev / self.feat_smooth_tau).clamp(0.0, 1.0)
+        return w * x + (1.0 - w) * mean
 
     @torch.no_grad()
     def _pad_to_patch_multiple(
@@ -301,6 +319,8 @@ class DinoSiameseHead(nn.Module):
         for i, (fa, fb, dm) in enumerate(zip(fa_list, fb_list, self.diff_modules)):
             fa = self.adapters[i](fa)
             fb = self.adapters[i](fb)
+            fa = self._smooth_feat(fa)
+            fb = self._smooth_feat(fb)
             diff_feats.append(dm(fa, fb))
 
         fused = self.decoder(diff_feats)  # [B, embed_dim, h, w]

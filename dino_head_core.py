@@ -163,8 +163,8 @@ class HeadCfg:
     dice_weight: float = float(_cfg_value("LOSS_WEIGHT_DICE", 1.0))
 
     # eval
-    full_eval: bool = True
-    eval_crop: int = int(_cfg_value("ORIGINAL_SIZE", 1024))
+    full_eval: bool = False  # fast eval by default; enable full_eval via CLI if needed
+    eval_crop: int = int(_cfg_value("CROP_SIZE", 256))
     thr_mode: str = "fixed"
     thr: float = 0.5
     topk: float = 0.01
@@ -173,7 +173,7 @@ class HeadCfg:
     min_area: int = 256
 
     # model
-    dino_name: str = "dinov2_vitb14_reg"
+    dino_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     fuse_mode: str = "abs+sum"
     use_whiten: bool = False
 
@@ -361,7 +361,7 @@ def save_vis_samples(
         img_a = batch["img_a"].to(device)
         img_b = batch["img_b"].to(device)
         gt = batch["label"]
-        name = batch["name"][0] if isinstance(batch["name"], list) else batch["name"]
+        names = batch["name"]
         if window is not None and stride is not None:
             prob = sliding_window_inference(
                 model=model,
@@ -378,32 +378,33 @@ def save_vis_samples(
         if smooth_k and smooth_k > 1:
             pad = smooth_k // 2
             prob = F.avg_pool2d(prob, kernel_size=smooth_k, stride=1, padding=pad)
-        prob_np = prob.squeeze().detach().cpu().numpy()
-        pred_np, used_thr = threshold_map(prob_np, thr_mode, thr, topk)
-        a_np = img_a.squeeze(0).detach().cpu().permute(1, 2, 0).numpy()
-        b_np = img_b.squeeze(0).detach().cpu().permute(1, 2, 0).numpy()
-        a_np = (a_np * std + mean).clip(0, 1)
-        b_np = (b_np * std + mean).clip(0, 1)
-        gt_np = gt.squeeze().cpu().numpy().astype(np.uint8)
-        overlay = b_np.copy()
-        overlay[pred_np == 1] = [1, 0, 0]
-        import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        axes[0, 0].imshow(a_np); axes[0, 0].set_title("T1"); axes[0, 0].axis("off")
-        axes[0, 1].imshow(b_np); axes[0, 1].set_title("T2"); axes[0, 1].axis("off")
-        im = axes[0, 2].imshow(prob_np, cmap="jet"); axes[0, 2].set_title("Prob"); axes[0, 2].axis("off"); fig.colorbar(im, ax=axes[0, 2], fraction=0.046)
-        axes[1, 0].imshow(pred_np, cmap="gray"); axes[1, 0].set_title(f"Pred ({thr_mode} thr={used_thr:.4f})"); axes[1, 0].axis("off")
-        axes[1, 1].imshow(gt_np, cmap="gray"); axes[1, 1].set_title("GT"); axes[1, 1].axis("off")
-        axes[1, 2].imshow(overlay); axes[1, 2].set_title("Overlay"); axes[1, 2].axis("off")
-        plt.tight_layout()
-        save_path = os.path.join(out_dir, f"{saved:03d}_{name}.png")
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        saved += 1
-        if saved >= n:
-            break
-
-
+        B = img_a.shape[0]
+        for bi in range(B):
+            prob_np = prob[bi].squeeze().detach().cpu().numpy()
+            pred_np, used_thr = threshold_map(prob_np, thr_mode, thr, topk)
+            a_np = img_a[bi].detach().cpu().permute(1, 2, 0).numpy()
+            b_np = img_b[bi].detach().cpu().permute(1, 2, 0).numpy()
+            a_np = (a_np * std + mean).clip(0, 1)
+            b_np = (b_np * std + mean).clip(0, 1)
+            gt_np = gt[bi].detach().cpu().numpy().astype(np.uint8)
+            overlay = b_np.copy()
+            overlay[pred_np == 1] = [1, 0, 0]
+            import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            axes[0, 0].imshow(a_np); axes[0, 0].set_title("T1"); axes[0, 0].axis("off")
+            axes[0, 1].imshow(b_np); axes[0, 1].set_title("T2"); axes[0, 1].axis("off")
+            im = axes[0, 2].imshow(prob_np, cmap="jet"); axes[0, 2].set_title("Prob"); axes[0, 2].axis("off"); fig.colorbar(im, ax=axes[0, 2], fraction=0.046)
+            axes[1, 0].imshow(pred_np, cmap="gray"); axes[1, 0].set_title(f"Pred ({thr_mode} thr={used_thr:.4f})"); axes[1, 0].axis("off")
+            axes[1, 1].imshow(gt_np, cmap="gray"); axes[1, 1].set_title("GT"); axes[1, 1].axis("off")
+            axes[1, 2].imshow(overlay); axes[1, 2].set_title("Overlay"); axes[1, 2].axis("off")
+            plt.tight_layout()
+            name = names[bi] if isinstance(names, list) else names
+            save_path = os.path.join(out_dir, f"{saved:03d}_{name}.png")
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            saved += 1
+            if saved >= n:
+                return
 
 
 def build_dataloaders(cfg: HeadCfg) -> Tuple[DataLoader, DataLoader, DataLoader]:

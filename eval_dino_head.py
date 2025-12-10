@@ -1,5 +1,5 @@
 """
-python eval_dino_head.py --checkpoint outputs/dino_head_cd/best.pt --data_root data/LEVIR-CD --out_dir outputs/eval --thr_mode fixed --smooth_k 3 --use_minarea --min_area 256 --vis --vis_n 10 --vis_dir outputs/eval/vis
+python eval_dino_head.py --checkpoint outputs/dino_head_cd/best.pt --data_root data/LEVIR-CD --out_dir outputs/eval --thr_mode fixed --smooth_k 3 --use_minarea --min_area 256 --vis --vis_n 10 --vis_dir outputs/eval/vis --full_eval
 """
 
 import argparse
