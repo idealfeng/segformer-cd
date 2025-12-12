@@ -43,9 +43,12 @@ def parse_args():
     parser.add_argument("--eval_crop", type=int, default=base.eval_crop)
     parser.add_argument("--window", type=int, default=base.eval_window, help="滑窗窗口（默认不用滑窗）")
     parser.add_argument("--stride", type=int, default=base.eval_stride, help="滑窗步长（需与window同时设置）")
-    parser.add_argument("--thr_mode", type=str, choices=["fixed", "topk", "otsu"], default=base.thr_mode)
+    parser.add_argument("--thr_mode", type=str, choices=["fixed", "topk", "otsu", "cluster"], default=base.thr_mode)
     parser.add_argument("--thr", type=float, default=base.thr)
     parser.add_argument("--topk", type=float, default=base.topk)
+    parser.add_argument("--cluster_k", type=int, default=base.cluster_k, help="Clusters in reliability space (2/3)")
+    parser.add_argument("--cluster_var_ks", type=int, default=base.cluster_var_ks, help="Kernel size for local variance")
+    parser.add_argument("--cluster_sample", type=float, default=base.cluster_sample, help="Sampling ratio for k-means")
     parser.add_argument("--smooth_k", type=int, default=base.smooth_k)
     parser.add_argument("--min_area", type=int, default=base.min_area)
     parser.add_argument("--vis_every", type=int, default=base.vis_every)
@@ -93,6 +96,9 @@ def parse_args():
         thr_mode=args.thr_mode,
         thr=args.thr,
         topk=args.topk,
+        cluster_k=args.cluster_k,
+        cluster_var_ks=args.cluster_var_ks,
+        cluster_sample=args.cluster_sample,
         smooth_k=args.smooth_k,
         use_minarea=args.use_minarea,
         min_area=args.min_area,
@@ -181,6 +187,9 @@ def main():
                 thr_mode=cfg.thr_mode,
                 thr=cfg.thr,
                 topk=cfg.topk,
+                cluster_k=cfg.cluster_k,
+                cluster_var_ks=cfg.cluster_var_ks,
+                cluster_sample=cfg.cluster_sample,
                 smooth_k=cfg.smooth_k,
                 use_minarea=cfg.use_minarea,
                 min_area=cfg.min_area,
@@ -237,6 +246,9 @@ def main():
                 thr_mode=cfg.thr_mode,
                 thr=cfg.thr,
                 topk=cfg.topk,
+                cluster_k=cfg.cluster_k,
+                cluster_var_ks=cfg.cluster_var_ks,
+                cluster_sample=cfg.cluster_sample,
                 smooth_k=cfg.smooth_k,
                 window=cfg.eval_window,
                 stride=cfg.eval_stride,
@@ -253,6 +265,9 @@ def main():
         thr_mode=cfg.thr_mode,
         thr=cfg.thr,
         topk=cfg.topk,
+        cluster_k=cfg.cluster_k,
+        cluster_var_ks=cfg.cluster_var_ks,
+        cluster_sample=cfg.cluster_sample,
         smooth_k=cfg.smooth_k,
         use_minarea=cfg.use_minarea,
         min_area=cfg.min_area,

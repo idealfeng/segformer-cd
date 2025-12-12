@@ -109,13 +109,97 @@ def otsu_threshold(score_map: np.ndarray) -> float:
     return float(bin_edges[k])
 
 
-def threshold_map(prob: np.ndarray, mode: str, fixed_thr: float, topk: float) -> Tuple[np.ndarray, float]:
+def _local_mean_var(prob: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute local mean/variance using avg_pool via torch for stability.
+    """
+    import torch.nn.functional as F
+    x = torch.from_numpy(prob).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    mean = F.avg_pool2d(x, kernel_size=k, stride=1, padding=k // 2)
+    var = F.avg_pool2d((x - mean) ** 2, kernel_size=k, stride=1, padding=k // 2)
+    return mean.squeeze().cpu().numpy(), var.squeeze().cpu().numpy()
+
+
+def _kmeans_2d(feat: np.ndarray, k: int, iters: int = 10) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Lightweight k-means for small k (2/3). feat: [N,2].
+    Returns centers [k,2], labels [N].
+    """
+    N = feat.shape[0]
+    if N == 0:
+        return np.zeros((k, 2), dtype=np.float64), np.zeros((0,), dtype=np.int64)
+    idx = np.random.choice(N, size=min(k, N), replace=False)
+    centers = feat[idx]
+    if centers.shape[0] < k:  # pad if samples < k
+        pad = np.tile(centers[:1], (k - centers.shape[0], 1))
+        centers = np.concatenate([centers, pad], axis=0)
+    labels = np.zeros(N, dtype=np.int64)
+    for _ in range(iters):
+        d = ((feat[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+        labels = d.argmin(axis=1)
+        for j in range(k):
+            mask = labels == j
+            if mask.any():
+                centers[j] = feat[mask].mean(axis=0)
+    return centers, labels
+
+
+def reliability_cluster_threshold(
+    prob: np.ndarray,
+    k: int = 2,
+    var_ks: int = 3,
+    sample_ratio: float = 0.1,
+    uncertain_zero: bool = True,
+) -> Tuple[np.ndarray, float]:
+    """
+    Cluster in 2D reliability space [p, local_var].
+    k=2: change / no-change; k=3: change / uncertain / no-change (uncertain->0 if uncertain_zero)
+    """
+    eps = 1e-6
+    p = prob.astype(np.float64)
+    mean, var = _local_mean_var(p, k=var_ks)
+    feat = np.stack([p, var], axis=-1).reshape(-1, 2)
+    # standardize per-dim
+    mu = feat.mean(axis=0)
+    std = feat.std(axis=0) + eps
+    feat_std = (feat - mu) / std
+    N = feat_std.shape[0]
+    n_sample = max(10, int(N * sample_ratio))
+    idx = np.random.choice(N, size=min(n_sample, N), replace=False)
+    centers, labels_sample = _kmeans_2d(feat_std[idx], k=k, iters=15)
+    # assign full map
+    d_full = ((feat_std[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+    labels_full = d_full.argmin(axis=1)
+    # decide ordering by prob dimension
+    center_prob = centers[:, 0]
+    order = np.argsort(center_prob)  # low -> high
+    mapped = np.zeros_like(labels_full)
+    for new_lab, old_lab in enumerate(order):
+        mapped[labels_full == old_lab] = new_lab
+    if k == 2:
+        pred = (mapped == 1).astype(np.uint8)
+    else:
+        high = k - 1  # highest prob
+        low = 0
+        pred = np.zeros_like(mapped, dtype=np.uint8)
+        pred[mapped == high] = 1
+        if not uncertain_zero:
+            mid_mask = (mapped != high) & (mapped != low)
+            pred[mid_mask] = 1  # treat uncertain as positive if desired
+    pred = pred.reshape(prob.shape)
+    return pred.astype(np.uint8), -1.0
+
+
+def threshold_map(prob: np.ndarray, mode: str, fixed_thr: float, topk: float, cluster_kwargs: Optional[Dict] = None) -> Tuple[np.ndarray, float]:
     if mode == "fixed":
         thr = float(fixed_thr)
     elif mode == "topk":
         thr = float(np.quantile(prob, 1.0 - topk))
     elif mode == "otsu":
         thr = otsu_threshold(prob)
+    elif mode == "cluster":
+        cluster_kwargs = cluster_kwargs or {}
+        return reliability_cluster_threshold(prob, **cluster_kwargs)
     else:
         raise ValueError(f"Unknown thr_mode: {mode}")
     pred = (prob > thr).astype(np.uint8)
@@ -168,6 +252,9 @@ class HeadCfg:
     thr_mode: str = "fixed"
     thr: float = 0.5
     topk: float = 0.01
+    cluster_k: int = 2
+    cluster_var_ks: int = 3
+    cluster_sample: float = 0.1
     smooth_k: int = 3
     use_minarea: bool = False
     min_area: int = 256
@@ -296,6 +383,9 @@ def evaluate(
     thr_mode: str,
     thr: float,
     topk: float,
+    cluster_k: int,
+    cluster_var_ks: int,
+    cluster_sample: float,
     smooth_k: int,
     use_minarea: bool,
     min_area: int,
@@ -325,14 +415,45 @@ def evaluate(
         if smooth_k and smooth_k > 1:
             pad = smooth_k // 2
             prob = F.avg_pool2d(prob, kernel_size=smooth_k, stride=1, padding=pad)
-        prob_np = prob.squeeze(0).squeeze(0).float().cpu().numpy()
-        gt_np = gt.squeeze(0).cpu().numpy().astype(np.uint8) if gt.ndim == 3 else gt.cpu().numpy().astype(np.uint8)
-        pred_np, _ = threshold_map(prob_np, thr_mode, thr, topk)
-        if use_minarea:
-            pred_np = filter_small_cc(pred_np, min_area=min_area)
-        pred_t = torch.from_numpy(pred_np.astype(np.uint8))
-        gt_t = torch.from_numpy((gt_np > 0).astype(np.uint8))
-        confusion_update(pred_t, gt_t, cm)
+        prob_np = prob.float().cpu().numpy()
+        gt_np = gt.cpu().numpy().astype(np.uint8)
+        if prob_np.ndim == 4:  # [B,1,H,W]
+            B = prob_np.shape[0]
+            for b in range(B):
+                p_np = prob_np[b, 0]
+                g_np = gt_np[b]
+                if g_np.ndim == 3 and g_np.shape[0] == 1:
+                    g_np = g_np[0]
+                pred_np, _ = threshold_map(
+                    p_np,
+                    thr_mode,
+                    thr,
+                    topk,
+                    cluster_kwargs=dict(k=cluster_k, var_ks=cluster_var_ks, sample_ratio=cluster_sample),
+                )
+                if use_minarea:
+                    pred_np = filter_small_cc(pred_np, min_area=min_area)
+                pred_t = torch.from_numpy(pred_np.astype(np.uint8))
+                gt_t = torch.from_numpy((g_np > 0).astype(np.uint8))
+                confusion_update(pred_t, gt_t, cm)
+        else:
+            p_np = prob_np.squeeze()
+            if gt_np.ndim > 2 and gt_np.shape[0] == 1:
+                g_np = gt_np.squeeze(0)
+            else:
+                g_np = gt_np
+            pred_np, _ = threshold_map(
+                p_np,
+                thr_mode,
+                thr,
+                topk,
+                cluster_kwargs=dict(k=cluster_k, var_ks=cluster_var_ks, sample_ratio=cluster_sample),
+            )
+            if use_minarea:
+                pred_np = filter_small_cc(pred_np, min_area=min_area)
+            pred_t = torch.from_numpy(pred_np.astype(np.uint8))
+            gt_t = torch.from_numpy((g_np > 0).astype(np.uint8))
+            confusion_update(pred_t, gt_t, cm)
         if print_every and (i % print_every == 0):
             print(f"[{i}/{len(loader)}] TP={cm['TP']} FP={cm['FP']} FN={cm['FN']} TN={cm['TN']}")
     return compute_metrics_from_cm(cm)
@@ -347,6 +468,9 @@ def save_vis_samples(
     thr_mode: str,
     thr: float,
     topk: float,
+    cluster_k: int,
+    cluster_var_ks: int,
+    cluster_sample: float,
     smooth_k: int,
     window: Optional[int] = None,
     stride: Optional[int] = None,
@@ -381,7 +505,13 @@ def save_vis_samples(
         B = img_a.shape[0]
         for bi in range(B):
             prob_np = prob[bi].squeeze().detach().cpu().numpy()
-            pred_np, used_thr = threshold_map(prob_np, thr_mode, thr, topk)
+            pred_np, used_thr = threshold_map(
+                prob_np,
+                thr_mode,
+                thr,
+                topk,
+                cluster_kwargs=dict(k=cluster_k, var_ks=cluster_var_ks, sample_ratio=cluster_sample),
+            )
             a_np = img_a[bi].detach().cpu().permute(1, 2, 0).numpy()
             b_np = img_b[bi].detach().cpu().permute(1, 2, 0).numpy()
             a_np = (a_np * std + mean).clip(0, 1)
