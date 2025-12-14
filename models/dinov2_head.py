@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Function
 from typing import List, Tuple
 
 try:
@@ -24,6 +25,42 @@ def norm2d(norm: str, ch: int) -> nn.Module:
         return nn.GroupNorm(g, ch)
     else:
         raise ValueError(f"Unknown norm: {norm}")
+
+class GradReverse(Function):
+    """Gradient reversal layer."""
+
+    @staticmethod
+    def forward(ctx, x, lambd=1.0):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+
+def grad_reverse(x, lambd=1.0):
+    return GradReverse.apply(x, lambd)
+
+
+class DomainDiscriminator(nn.Module):
+    """Lightweight domain discriminator over fused features."""
+
+    def __init__(self, in_channels: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, bias=False),
+            norm2d("gn", in_channels),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x):  # x: [B,C,h,w]
+        return self.net(x)
 
 
 class ChannelAttention(nn.Module):
@@ -128,6 +165,10 @@ class DinoSiameseHead(nn.Module):
         feat_smooth: bool = True,
         feat_smooth_kernel: int = 3,
         feat_smooth_tau: float = 1.0,
+        use_domain_adv: bool = False,
+        domain_hidden: int = 256,
+        domain_grl: float = 1.0,
+        use_style_norm: bool = False,
     ):
         super().__init__()
         self.patch = int(patch)
@@ -138,6 +179,9 @@ class DinoSiameseHead(nn.Module):
         self.feat_smooth = bool(feat_smooth)
         self.feat_smooth_kernel = int(max(1, feat_smooth_kernel))
         self.feat_smooth_tau = float(max(1e-6, feat_smooth_tau))
+        self.use_style_norm = bool(use_style_norm)
+        self.use_domain_adv = bool(use_domain_adv)
+        self.domain_grl = float(domain_grl)
 
         self.use_hf = "dinov3" in dino_name.lower() or dino_name.startswith(
             "facebook/dinov3"
@@ -187,6 +231,8 @@ class DinoSiameseHead(nn.Module):
             embed_dim=embed_dim,
             norm=self.norm,
         )
+
+        self.domain_head = DomainDiscriminator(embed_dim, domain_hidden) if self.use_domain_adv else None
 
         # lightweight refinement head
         head_layers = []
@@ -324,6 +370,15 @@ class DinoSiameseHead(nn.Module):
             diff_feats.append(dm(fa, fb))
 
         fused = self.decoder(diff_feats)  # [B, embed_dim, h, w]
+        if self.use_style_norm:
+            fused = fused - fused.mean(dim=(2, 3), keepdim=True)
+            fused = fused / fused.std(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+
+        domain_logit = None
+        if self.domain_head is not None:
+            dom_feat = grad_reverse(fused, self.domain_grl)
+            domain_logit = self.domain_head(dom_feat)
+
         x = self.head(fused)  # [B, head_channels, h, w]
         logit_patch = self.classifier(x)  # [B, 1, h, w]
 
@@ -336,7 +391,7 @@ class DinoSiameseHead(nn.Module):
                 logit, size=(H, W), mode="bilinear", align_corners=False
             )
 
-        return {"pred": logit}
+        return {"pred": logit, "feat": fused, "domain_logit": domain_logit}
 
 
 __all__ = [

@@ -58,6 +58,20 @@ def ensure_dir(p: str):
     return p
 
 
+def style_perturb(x: torch.Tensor, sigma: float = 0.15, blur_prob: float = 0.3) -> torch.Tensor:
+    """
+    Style/appearance perturbation: channel-wise scale/bias + noise and optional blur.
+    Keeps semantics while altering low-level style for counterfactual consistency.
+    """
+    noise = torch.randn_like(x) * sigma
+    scale = 1.0 + torch.randn(x.shape[0], x.shape[1], 1, 1, device=x.device) * 0.1
+    bias = torch.randn(x.shape[0], x.shape[1], 1, 1, device=x.device) * 0.05
+    x = x * scale + bias + noise
+    if torch.rand(1, device=x.device).item() < blur_prob:
+        x = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+    return x.clamp(-3, 3)
+
+
 def confusion_update(pred: torch.Tensor, gt: torch.Tensor, cm: Dict[str, int]):
     pred = pred.view(-1).to(torch.int64)
     gt = gt.view(-1).to(torch.int64)
@@ -161,6 +175,12 @@ class HeadCfg:
     grad_accum: int = int(_cfg_value("GRADIENT_ACCUMULATION_STEPS", 2))
     bce_weight: float = float(_cfg_value("LOSS_WEIGHT_BCE", 1.0))
     dice_weight: float = float(_cfg_value("LOSS_WEIGHT_DICE", 1.0))
+    lambda_consis: float = 0.0  # counterfactual consistency weight
+    lambda_domain: float = 0.0  # domain confusion weight
+    self_sup_weight: float = 0.0  # auxiliary supervised weight on augmented view
+    style_aug_prob: float = 0.0
+    style_aug_sigma: float = 0.2
+    style_blur_prob: float = 0.3
 
     # eval
     full_eval: bool = False  # fast eval by default; enable full_eval via CLI if needed
@@ -176,6 +196,10 @@ class HeadCfg:
     dino_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     fuse_mode: str = "abs+sum"
     use_whiten: bool = False
+    use_domain_adv: bool = False
+    domain_hidden: int = 256
+    domain_grl: float = 1.0
+    use_style_norm: bool = False
 
     # saving / logging
     save_best: bool = True
@@ -257,7 +281,23 @@ def sliding_window_inference(
 
 from models.dinov2_head import DinoSiameseHead
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler, device: str, bce_w: float, dice_w: float, grad_accum: int, log_every: int):
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler,
+    device: str,
+    bce_w: float,
+    dice_w: float,
+    grad_accum: int,
+    log_every: int,
+    lambda_consis: float = 0.0,
+    lambda_domain: float = 0.0,
+    self_sup_weight: float = 0.0,
+    style_aug_prob: float = 0.0,
+    style_aug_sigma: float = 0.2,
+    style_blur_prob: float = 0.3,
+):
     model.train()
     bce = nn.BCEWithLogitsLoss()
     optimizer.zero_grad(set_to_none=True)
@@ -274,9 +314,41 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim
         with torch.cuda.amp.autocast(enabled=(device.startswith("cuda") and torch.cuda.is_available())):
             out = model(img_a, img_b)
             logits = out["pred"] if isinstance(out, dict) else out
+            prob = torch.sigmoid(logits)
             loss_bce = bce(logits, label)
             loss_dice = dice_loss_with_logits(logits, label)
             loss = (bce_w * loss_bce + dice_w * loss_dice) / grad_accum
+
+            do_cf = style_aug_prob > 0 and (lambda_consis > 0 or lambda_domain > 0 or self_sup_weight > 0)
+            if do_cf and torch.rand(1, device=img_a.device).item() < style_aug_prob:
+                img_a_cf = style_perturb(img_a, sigma=style_aug_sigma, blur_prob=style_blur_prob)
+                img_b_cf = style_perturb(img_b, sigma=style_aug_sigma, blur_prob=style_blur_prob)
+                out_cf = model(img_a_cf, img_b_cf)
+                logits_cf = out_cf["pred"] if isinstance(out_cf, dict) else out_cf
+                prob_cf = torch.sigmoid(logits_cf)
+
+                if self_sup_weight > 0:
+                    cf_bce = bce(logits_cf, label)
+                    cf_dice = dice_loss_with_logits(logits_cf, label)
+                    loss = loss + self_sup_weight * (cf_bce + cf_dice) / grad_accum
+
+                if lambda_consis > 0:
+                    loss = loss + lambda_consis * F.l1_loss(prob, prob_cf) / grad_accum
+
+                if lambda_domain > 0:
+                    dom_logits_list = []
+                    dom_labels_list = []
+                    if isinstance(out, dict) and out.get("domain_logit") is not None:
+                        dom_logits_list.append(out["domain_logit"].view(-1))
+                        dom_labels_list.append(torch.zeros_like(out["domain_logit"].view(-1)))
+                    if isinstance(out_cf, dict) and out_cf.get("domain_logit") is not None:
+                        dom_logits_list.append(out_cf["domain_logit"].view(-1))
+                        dom_labels_list.append(torch.ones_like(out_cf["domain_logit"].view(-1)))
+                    if dom_logits_list:
+                        dom_logits = torch.cat(dom_logits_list, dim=0)
+                        dom_labels = torch.cat(dom_labels_list, dim=0)
+                        dom_loss = F.binary_cross_entropy_with_logits(dom_logits, dom_labels)
+                        loss = loss + lambda_domain * dom_loss / grad_accum
         scaler.scale(loss).backward()
         if it % grad_accum == 0:
             scaler.step(optimizer)

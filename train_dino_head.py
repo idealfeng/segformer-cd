@@ -40,6 +40,12 @@ def parse_args():
     parser.add_argument("--grad_accum", type=int, default=base.grad_accum)
     parser.add_argument("--bce_weight", type=float, default=base.bce_weight)
     parser.add_argument("--dice_weight", type=float, default=base.dice_weight)
+    parser.add_argument("--lambda_consis", type=float, default=base.lambda_consis, help="counterfactual consistency weight")
+    parser.add_argument("--lambda_domain", type=float, default=base.lambda_domain, help="domain confusion weight")
+    parser.add_argument("--self_sup_weight", type=float, default=base.self_sup_weight, help="aux supervised weight on perturbed view")
+    parser.add_argument("--style_aug_prob", type=float, default=base.style_aug_prob, help="probability to apply style perturbation")
+    parser.add_argument("--style_aug_sigma", type=float, default=base.style_aug_sigma, help="noise scale for style perturbation")
+    parser.add_argument("--style_blur_prob", type=float, default=base.style_blur_prob, help="blur probability for style perturbation")
     parser.add_argument("--eval_crop", type=int, default=base.eval_crop)
     parser.add_argument("--window", type=int, default=base.eval_window, help="滑窗窗口（默认不用滑窗）")
     parser.add_argument("--stride", type=int, default=base.eval_stride, help="滑窗步长（需与window同时设置）")
@@ -54,6 +60,10 @@ def parse_args():
     parser.add_argument("--dino_name", type=str, default=base.dino_name)
     parser.add_argument("--fuse_mode", type=str, choices=["abs", "abs+sum", "cat4"], default=base.fuse_mode)
     parser.add_argument("--use_whiten", action="store_true", default=base.use_whiten)
+    parser.add_argument("--use_domain_adv", action="store_true", default=base.use_domain_adv)
+    parser.add_argument("--domain_hidden", type=int, default=base.domain_hidden)
+    parser.add_argument("--domain_grl", type=float, default=base.domain_grl)
+    parser.add_argument("--use_style_norm", action="store_true", default=base.use_style_norm)
     parser.add_argument("--full_eval", dest="full_eval", action="store_true")
     parser.add_argument("--no_full_eval", dest="full_eval", action="store_false")
     parser.set_defaults(full_eval=base.full_eval)
@@ -86,6 +96,12 @@ def parse_args():
         grad_accum=args.grad_accum,
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,
+        lambda_consis=args.lambda_consis,
+        lambda_domain=args.lambda_domain,
+        self_sup_weight=args.self_sup_weight,
+        style_aug_prob=args.style_aug_prob,
+        style_aug_sigma=args.style_aug_sigma,
+        style_blur_prob=args.style_blur_prob,
         full_eval=args.full_eval,
         eval_crop=args.eval_crop,
         eval_window=args.window,
@@ -98,6 +114,10 @@ def parse_args():
         min_area=args.min_area,
         dino_name=args.dino_name,
         use_whiten=args.use_whiten,
+        use_domain_adv=args.use_domain_adv,
+        domain_hidden=args.domain_hidden,
+        domain_grl=args.domain_grl,
+        use_style_norm=args.use_style_norm,
         save_best=args.save_best,
         save_last=args.save_last,
         vis_every=args.vis_every,
@@ -122,6 +142,10 @@ def main():
     model = DinoSiameseHead(
         dino_name=cfg.dino_name,
         use_whiten=cfg.use_whiten,
+        use_domain_adv=cfg.use_domain_adv,
+        domain_hidden=cfg.domain_hidden,
+        domain_grl=cfg.domain_grl,
+        use_style_norm=cfg.use_style_norm,
     ).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -171,6 +195,12 @@ def main():
             dice_w=cfg.dice_weight,
             grad_accum=cfg.grad_accum,
             log_every=cfg.log_every,
+            lambda_consis=cfg.lambda_consis,
+            lambda_domain=cfg.lambda_domain,
+            self_sup_weight=cfg.self_sup_weight,
+            style_aug_prob=cfg.style_aug_prob,
+            style_aug_sigma=cfg.style_aug_sigma,
+            style_blur_prob=cfg.style_blur_prob,
         )
         do_eval = (ep % eval_every == 0) or (ep == cfg.epochs)
         if do_eval:

@@ -28,6 +28,7 @@ except Exception:
 
 def parse_args():
     base = HeadCfg()
+    beta_default = getattr(base, "beta_prior", 0.01)
     parser = argparse.ArgumentParser(description="Evaluate DINOv2 change-detection head")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint (best.pt/last.pt)")
     parser.add_argument("--data_root", type=str, default=base.data_root)
@@ -41,6 +42,7 @@ def parse_args():
     parser.add_argument("--thr_mode", type=str, choices=["fixed", "topk", "otsu"], default=base.thr_mode)
     parser.add_argument("--thr", type=float, default=base.thr)
     parser.add_argument("--topk", type=float, default=base.topk)
+    parser.add_argument("--beta_prior", type=float, default=beta_default, help="Expected change ratio prior for beta mixture")
     parser.add_argument("--smooth_k", type=int, default=base.smooth_k)
     parser.add_argument("--use_minarea", action="store_true", default=base.use_minarea)
     parser.add_argument("--min_area", type=int, default=base.min_area)
@@ -100,6 +102,10 @@ def main():
     model = DinoSiameseHead(
         dino_name=load_cfg.get("dino_name", cfg.dino_name) if isinstance(load_cfg, dict) else cfg.dino_name,
         use_whiten=load_cfg.get("use_whiten", cfg.use_whiten) if isinstance(load_cfg, dict) else cfg.use_whiten,
+        use_domain_adv=load_cfg.get("use_domain_adv", cfg.use_domain_adv) if isinstance(load_cfg, dict) else cfg.use_domain_adv,
+        domain_hidden=load_cfg.get("domain_hidden", cfg.domain_hidden) if isinstance(load_cfg, dict) else cfg.domain_hidden,
+        domain_grl=load_cfg.get("domain_grl", cfg.domain_grl) if isinstance(load_cfg, dict) else cfg.domain_grl,
+        use_style_norm=load_cfg.get("use_style_norm", cfg.use_style_norm) if isinstance(load_cfg, dict) else cfg.use_style_norm,
     ).to(device)
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
     print(f"Loaded checkpoint from {args.checkpoint}")
