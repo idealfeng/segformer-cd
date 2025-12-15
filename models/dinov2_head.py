@@ -63,6 +63,99 @@ class DomainDiscriminator(nn.Module):
         return self.net(x)
 
 
+class ConvBlock(nn.Module):
+    """Two conv layers with norm and GELU; optional stride for downsampling."""
+
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, norm: str = "gn"):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False),
+            norm2d(norm, out_ch),
+            nn.GELU(),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            norm2d(norm, out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class ASPP(nn.Module):
+    """Atrous Spatial Pyramid Pooling with a global context branch."""
+
+    def __init__(self, in_ch: int, out_ch: int, dilations=(1, 3, 6, 9), norm: str = "gn"):
+        super().__init__()
+        self.branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=d, dilation=d, bias=False),
+                    norm2d(norm, out_ch),
+                    nn.GELU(),
+                )
+                for d in dilations
+            ]
+        )
+        self.global_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.GELU(),
+        )
+        self.proj = nn.Sequential(
+            nn.Conv2d(out_ch * (len(dilations) + 1), out_ch, kernel_size=1, bias=False),
+            norm2d(norm, out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H, W = x.shape[-2:]
+        feats = [b(x) for b in self.branches]
+        g = self.global_branch(x)
+        g = F.interpolate(g, size=(H, W), mode="bilinear", align_corners=False)
+        feats.append(g)
+        x = torch.cat(feats, dim=1)
+        return self.proj(x)
+
+
+class UpBlock(nn.Module):
+    """Upsample + skip concat + ConvBlock."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, norm: str = "gn"):
+        super().__init__()
+        self.conv = ConvBlock(in_ch + skip_ch, out_ch, stride=1, norm=norm)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+
+class HeavyDecoder(nn.Module):
+    """
+    U-Net style decoder with ASPP context.
+    Input: fused [B, C, H, W]; Output: refined [B, base_ch, H, W].
+    """
+
+    def __init__(self, in_ch: int, base_ch: int = 256, norm: str = "gn"):
+        super().__init__()
+        self.enc1 = ConvBlock(in_ch, base_ch, stride=1, norm=norm)
+        self.enc2 = ConvBlock(base_ch, base_ch, stride=2, norm=norm)
+        self.enc3 = ConvBlock(base_ch, base_ch, stride=2, norm=norm)
+        self.aspp = ASPP(base_ch, base_ch, dilations=(1, 3, 6, 9), norm=norm)
+        self.dec2 = UpBlock(base_ch, base_ch, base_ch, norm=norm)
+        self.dec1 = UpBlock(base_ch, base_ch, base_ch, norm=norm)
+        self.refine = ConvBlock(base_ch, base_ch, stride=1, norm=norm)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.enc1(x)
+        x2 = self.enc2(x1)
+        x3 = self.enc3(x2)
+        x3 = self.aspp(x3)
+        u2 = self.dec2(x3, x2)
+        u1 = self.dec1(u2, x1)
+        return self.refine(u1)
+
+
 class ChannelAttention(nn.Module):
     """Channel attention (SE-style)."""
 
@@ -140,6 +233,78 @@ class MultiScaleFusionDecoder(nn.Module):
             aligned.append(feat)
         fused = torch.cat(aligned, dim=1)
         return self.fusion(fused)
+
+
+class EnhancedMLPDecoder(nn.Module):
+    """
+    Lightweight SegFormer-style decoder with BN fusion and shallow refinement.
+    Projects each scale to a shared dim, fuses, refines, and returns feature map.
+    """
+
+    def __init__(
+        self,
+        in_channels_list: List[int],
+        embedding_dim: int = 512,
+        decoder_depth: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.decoder_depth = decoder_depth
+        self.dropout = dropout
+
+        self.linear_layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(in_ch, embedding_dim, 1, bias=False),
+                    nn.BatchNorm2d(embedding_dim),
+                    nn.ReLU(inplace=True),
+                )
+                for in_ch in in_channels_list
+            ]
+        )
+
+        fusion_in_dim = embedding_dim * len(in_channels_list)
+        self.fusion_layers = nn.Sequential(
+            nn.Conv2d(fusion_in_dim, embedding_dim, 1, bias=False),
+            nn.BatchNorm2d(embedding_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embedding_dim, embedding_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(embedding_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        refinement = []
+        in_ch = embedding_dim
+        out_ch = embedding_dim // 2
+        for _ in range(decoder_depth):
+            refinement.extend(
+                [
+                    nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+                    nn.BatchNorm2d(out_ch),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+            if dropout > 0:
+                refinement.append(nn.Dropout2d(dropout))
+            in_ch = out_ch
+            out_ch = max(64, out_ch // 2)
+        self.refinement = nn.Sequential(*refinement)
+        self.out_channels = in_ch
+
+    def forward(self, diff_features: List[torch.Tensor]) -> torch.Tensor:
+        # assume diff_features have same spatial size
+        B, _, H, W = diff_features[0].shape
+        mlp_feats = []
+        for i, feat in enumerate(diff_features):
+            feat = self.linear_layers[i](feat)
+            if feat.shape[2:] != (H, W):
+                feat = F.interpolate(feat, size=(H, W), mode="bilinear", align_corners=False)
+            mlp_feats.append(feat)
+        fused = torch.cat(mlp_feats, dim=1)
+        fused = self.fusion_layers(fused)
+        refined = self.refinement(fused)
+        return refined
 
 
 class DinoSiameseHead(nn.Module):
@@ -231,24 +396,16 @@ class DinoSiameseHead(nn.Module):
             embed_dim=embed_dim,
             norm=self.norm,
         )
+        self.mlp_decoder = EnhancedMLPDecoder(
+            in_channels_list=[self.adapter_dim] * len(self.selected_layers),
+            embedding_dim=embed_dim,
+            decoder_depth=head_depth,
+            dropout=dropout,
+        )
 
         self.domain_head = DomainDiscriminator(embed_dim, domain_hidden) if self.use_domain_adv else None
 
-        # lightweight refinement head
-        head_layers = []
-        in_ch = embed_dim
-        for i in range(head_depth):
-            head_layers += [
-                nn.Conv2d(in_ch, head_channels, 3, padding=1, bias=False),
-                norm2d(self.norm, head_channels),
-                nn.GELU(),
-            ]
-            if dropout > 0 and i < head_depth - 1:
-                head_layers.append(nn.Dropout2d(dropout))
-            in_ch = head_channels
-
-        self.head = nn.Sequential(*head_layers)
-        self.classifier = nn.Conv2d(head_channels, 1, 1)
+        self.classifier = nn.Conv2d(self.mlp_decoder.out_channels, 1, 1)
 
     def _smooth_feat(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -379,8 +536,8 @@ class DinoSiameseHead(nn.Module):
             dom_feat = grad_reverse(fused, self.domain_grl)
             domain_logit = self.domain_head(dom_feat)
 
-        x = self.head(fused)  # [B, head_channels, h, w]
-        logit_patch = self.classifier(x)  # [B, 1, h, w]
+        refined = self.mlp_decoder(diff_feats)  # [B, C', h, w]
+        logit_patch = self.classifier(refined)  # [B, 1, h, w]
 
         logit_pad = F.interpolate(
             logit_patch, size=(Hp, Wp), mode="bilinear", align_corners=False
@@ -391,7 +548,7 @@ class DinoSiameseHead(nn.Module):
                 logit, size=(H, W), mode="bilinear", align_corners=False
             )
 
-        return {"pred": logit, "feat": fused, "domain_logit": domain_logit}
+        return {"pred": logit, "feat": refined, "domain_logit": domain_logit}
 
 
 __all__ = [
@@ -399,4 +556,6 @@ __all__ = [
     "ChannelAttention",
     "DifferenceModule",
     "MultiScaleFusionDecoder",
+    "HeavyDecoder",
+    "EnhancedMLPDecoder",
 ]
