@@ -200,6 +200,8 @@ class HeadCfg:
     domain_hidden: int = 256
     domain_grl: float = 1.0
     use_style_norm: bool = False
+    proto_path: str = ""
+    proto_weight: float = 0.0
 
     # saving / logging
     save_best: bool = True

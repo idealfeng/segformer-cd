@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 from typing import List, Tuple
+import numpy as np
 
 try:
     from transformers import AutoModel
@@ -307,6 +308,36 @@ class EnhancedMLPDecoder(nn.Module):
         return refined
 
 
+class PrototypeChangeHead(nn.Module):
+    """
+    Prototype-based change scoring: fixed prototypes (e.g., from offline k-means).
+    Score = 1 - sum_k min(p_a[k], p_b[k]) where p_* are softmax over prototypes.
+    """
+
+    def __init__(self, prototypes: np.ndarray, proto_weight: float = 0.5):
+        super().__init__()
+        if prototypes.ndim != 2:
+            raise ValueError("prototypes must be 2D [K, C]")
+        proto = torch.from_numpy(prototypes.astype(np.float32))
+        self.register_buffer("proto", proto)  # [K, C]
+        self.weight = float(proto_weight)
+
+    def forward(self, feat_a: torch.Tensor, feat_b: torch.Tensor) -> torch.Tensor:
+        # feat_*: [B, C, H, W]
+        proto = F.normalize(self.proto, dim=1)  # [K, C]
+        feat_a_n = F.normalize(feat_a, dim=1)
+        feat_b_n = F.normalize(feat_b, dim=1)
+        sim_a = torch.einsum("bchw,kc->bkhw", feat_a_n, proto)
+        sim_b = torch.einsum("bchw,kc->bkhw", feat_b_n, proto)
+        p_a = F.softmax(sim_a, dim=1)
+        p_b = F.softmax(sim_b, dim=1)
+        overlap = torch.sum(torch.minimum(p_a, p_b), dim=1, keepdim=True)  # [B,1,H,W]
+        change = 1.0 - overlap
+        change = change.clamp(1e-4, 1 - 1e-4)
+        proto_logit = torch.logit(change)
+        return self.weight * proto_logit  # [B,1,H,W]
+
+
 class DinoSiameseHead(nn.Module):
     """
     DINOv2 / DINOv3 siamese head for change detection.
@@ -334,6 +365,8 @@ class DinoSiameseHead(nn.Module):
         domain_hidden: int = 256,
         domain_grl: float = 1.0,
         use_style_norm: bool = False,
+        proto_path: str = None,
+        proto_weight: float = 0.0,
     ):
         super().__init__()
         self.patch = int(patch)
@@ -347,6 +380,8 @@ class DinoSiameseHead(nn.Module):
         self.use_style_norm = bool(use_style_norm)
         self.use_domain_adv = bool(use_domain_adv)
         self.domain_grl = float(domain_grl)
+        self.proto_path = proto_path
+        self.proto_weight = float(proto_weight)
 
         self.use_hf = "dinov3" in dino_name.lower() or dino_name.startswith(
             "facebook/dinov3"
@@ -406,6 +441,15 @@ class DinoSiameseHead(nn.Module):
         self.domain_head = DomainDiscriminator(embed_dim, domain_hidden) if self.use_domain_adv else None
 
         self.classifier = nn.Conv2d(self.mlp_decoder.out_channels, 1, 1)
+
+        self.proto_head = None
+        if proto_path:
+            try:
+                proto_arr = np.load(proto_path)
+                self.proto_head = PrototypeChangeHead(proto_arr, proto_weight=self.proto_weight)
+            except Exception as e:
+                print(f"Failed to load prototypes from {proto_path}: {e}")
+                self.proto_head = None
 
     def _smooth_feat(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -519,11 +563,16 @@ class DinoSiameseHead(nn.Module):
             )
 
         diff_feats = []
+        deep_fa = None
+        deep_fb = None
         for i, (fa, fb, dm) in enumerate(zip(fa_list, fb_list, self.diff_modules)):
             fa = self.adapters[i](fa)
             fb = self.adapters[i](fb)
             fa = self._smooth_feat(fa)
             fb = self._smooth_feat(fb)
+            if i == len(self.diff_modules) - 1:
+                deep_fa = fa
+                deep_fb = fb
             diff_feats.append(dm(fa, fb))
 
         fused = self.decoder(diff_feats)  # [B, embed_dim, h, w]
@@ -539,6 +588,11 @@ class DinoSiameseHead(nn.Module):
         refined = self.mlp_decoder(diff_feats)  # [B, C', h, w]
         logit_patch = self.classifier(refined)  # [B, 1, h, w]
 
+        proto_logit = None
+        if self.proto_head is not None and deep_fa is not None and deep_fb is not None:
+            proto_logit = self.proto_head(deep_fa, deep_fb)
+            logit_patch = logit_patch + proto_logit
+
         logit_pad = F.interpolate(
             logit_patch, size=(Hp, Wp), mode="bilinear", align_corners=False
         )
@@ -548,7 +602,7 @@ class DinoSiameseHead(nn.Module):
                 logit, size=(H, W), mode="bilinear", align_corners=False
             )
 
-        return {"pred": logit, "feat": refined, "domain_logit": domain_logit}
+        return {"pred": logit, "feat": refined, "domain_logit": domain_logit, "proto_logit": proto_logit}
 
 
 __all__ = [
@@ -558,4 +612,5 @@ __all__ = [
     "MultiScaleFusionDecoder",
     "HeavyDecoder",
     "EnhancedMLPDecoder",
+    "PrototypeChangeHead",
 ]

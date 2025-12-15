@@ -64,6 +64,8 @@ def parse_args():
     parser.add_argument("--domain_hidden", type=int, default=base.domain_hidden)
     parser.add_argument("--domain_grl", type=float, default=base.domain_grl)
     parser.add_argument("--use_style_norm", action="store_true", default=base.use_style_norm)
+    parser.add_argument("--proto_path", type=str, default=base.proto_path, help="npy path for prototype vectors [K,C]")
+    parser.add_argument("--proto_weight", type=float, default=base.proto_weight, help="weight for prototype change logit")
     parser.add_argument("--full_eval", dest="full_eval", action="store_true")
     parser.add_argument("--no_full_eval", dest="full_eval", action="store_false")
     parser.set_defaults(full_eval=base.full_eval)
@@ -118,6 +120,8 @@ def parse_args():
         domain_hidden=args.domain_hidden,
         domain_grl=args.domain_grl,
         use_style_norm=args.use_style_norm,
+        proto_path=args.proto_path,
+        proto_weight=args.proto_weight,
         save_best=args.save_best,
         save_last=args.save_last,
         vis_every=args.vis_every,
@@ -146,6 +150,8 @@ def main():
         domain_hidden=cfg.domain_hidden,
         domain_grl=cfg.domain_grl,
         use_style_norm=cfg.use_style_norm,
+        proto_path=cfg.proto_path,
+        proto_weight=cfg.proto_weight,
     ).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
