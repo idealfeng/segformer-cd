@@ -108,6 +108,7 @@ def main():
         use_style_norm=load_cfg.get("use_style_norm", cfg.use_style_norm) if isinstance(load_cfg, dict) else cfg.use_style_norm,
         proto_path=load_cfg.get("proto_path", cfg.proto_path) if isinstance(load_cfg, dict) else cfg.proto_path,
         proto_weight=load_cfg.get("proto_weight", cfg.proto_weight) if isinstance(load_cfg, dict) else cfg.proto_weight,
+        boundary_dim=load_cfg.get("boundary_dim", cfg.boundary_dim) if isinstance(load_cfg, dict) else cfg.boundary_dim,
     ).to(device)
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
     print(f"Loaded checkpoint from {args.checkpoint}")

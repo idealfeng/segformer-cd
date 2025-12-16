@@ -236,6 +236,69 @@ class MultiScaleFusionDecoder(nn.Module):
         return self.fusion(fused)
 
 
+class DepthwiseSeparableConv(nn.Module):
+    """Depthwise separable conv block with norm + GELU."""
+
+    def __init__(self, in_ch: int, out_ch: int, norm: str = "gn"):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, groups=in_ch, bias=False),
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            norm2d(norm, out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class BoundaryDecoder(nn.Module):
+    """
+    Boundary-aware branch (SegFormer-style):
+    - Project multi-scale diff features to shared dim
+    - Upsample to highest resolution and fuse
+    - Light depthwise refinement + 1x1 prediction
+    """
+
+    def __init__(
+        self, in_channels_list: List[int], embed_dim: int = 192, norm: str = "gn"
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.proj = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(in_ch, embed_dim, 1, bias=False),
+                    norm2d(norm, embed_dim),
+                    nn.GELU(),
+                )
+                for in_ch in in_channels_list
+            ]
+        )
+        fuse_in = embed_dim * len(in_channels_list)
+        self.fuse = nn.Sequential(
+            DepthwiseSeparableConv(fuse_in, embed_dim, norm=norm),
+            DepthwiseSeparableConv(embed_dim, embed_dim, norm=norm),
+        )
+        self.refine = DepthwiseSeparableConv(embed_dim, embed_dim, norm=norm)
+        self.out_conv = nn.Conv2d(embed_dim, 1, 1)
+        self.out_channels = embed_dim
+
+    def forward(self, features: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        target_size = features[0].shape[2:]
+        aligned = []
+        for i, feat in enumerate(features):
+            feat = self.proj[i](feat)
+            if feat.shape[2:] != target_size:
+                feat = F.interpolate(feat, size=target_size, mode="bilinear", align_corners=False)
+            aligned.append(feat)
+        fused = torch.cat(aligned, dim=1)
+        fused = self.fuse(fused)
+        refined = self.refine(fused)
+        logit = self.out_conv(refined)
+        return logit, refined
+
+
 class EnhancedMLPDecoder(nn.Module):
     """
     Lightweight SegFormer-style decoder with BN fusion and shallow refinement.
@@ -344,6 +407,7 @@ class DinoSiameseHead(nn.Module):
     - Supports DINOv2 (torch.hub) and DINOv3 (HF AutoModel).
     - Adapter to reduce dim, GroupNorm by default.
     - forward returns dict {"pred": logits}.
+    - Boundary-aware branch (SegFormer-style) sharpens edges for cross-domain generalization.
     """
 
     def __init__(
@@ -367,6 +431,7 @@ class DinoSiameseHead(nn.Module):
         use_style_norm: bool = False,
         proto_path: str = None,
         proto_weight: float = 0.0,
+        boundary_dim: int = 0,
     ):
         super().__init__()
         self.patch = int(patch)
@@ -382,6 +447,7 @@ class DinoSiameseHead(nn.Module):
         self.domain_grl = float(domain_grl)
         self.proto_path = proto_path
         self.proto_weight = float(proto_weight)
+        self.boundary_dim = int(boundary_dim)
 
         self.use_hf = "dinov3" in dino_name.lower() or dino_name.startswith(
             "facebook/dinov3"
@@ -441,6 +507,20 @@ class DinoSiameseHead(nn.Module):
         self.domain_head = DomainDiscriminator(embed_dim, domain_hidden) if self.use_domain_adv else None
 
         self.classifier = nn.Conv2d(self.mlp_decoder.out_channels, 1, 1)
+
+        self.boundary_head = None
+        self.boundary_refine = None
+        if self.boundary_dim > 0:
+            self.boundary_head = BoundaryDecoder(
+                in_channels_list=[self.adapter_dim] * len(self.selected_layers),
+                embed_dim=self.boundary_dim,
+                norm=self.norm,
+            )
+            self.boundary_refine = DepthwiseSeparableConv(
+                self.mlp_decoder.out_channels + self.boundary_head.out_channels,
+                self.mlp_decoder.out_channels,
+                norm=self.norm,
+            )
 
         self.proto_head = None
         if proto_path:
@@ -586,6 +666,20 @@ class DinoSiameseHead(nn.Module):
             domain_logit = self.domain_head(dom_feat)
 
         refined = self.mlp_decoder(diff_feats)  # [B, C', h, w]
+
+        boundary_logit = None
+        if self.boundary_head is not None:
+            boundary_logit, boundary_feat = self.boundary_head(diff_feats)
+            boundary_feat = F.interpolate(
+                boundary_feat, size=refined.shape[-2:], mode="bilinear", align_corners=False
+            )
+            refined = torch.cat([refined, boundary_feat], dim=1)
+            refined = self.boundary_refine(refined)
+            boundary_att = torch.sigmoid(
+                F.interpolate(boundary_logit, size=refined.shape[-2:], mode="bilinear", align_corners=False)
+            )
+            refined = refined * (1.0 + boundary_att)
+
         logit_patch = self.classifier(refined)  # [B, 1, h, w]
 
         proto_logit = None
@@ -602,7 +696,24 @@ class DinoSiameseHead(nn.Module):
                 logit, size=(H, W), mode="bilinear", align_corners=False
             )
 
-        return {"pred": logit, "feat": refined, "domain_logit": domain_logit, "proto_logit": proto_logit}
+        boundary_up = None
+        if boundary_logit is not None:
+            boundary_up = F.interpolate(
+                boundary_logit, size=(Hp, Wp), mode="bilinear", align_corners=False
+            )
+            boundary_up = boundary_up[..., :H0, :W0]
+            if boundary_up.shape[-2:] != (H, W):
+                boundary_up = F.interpolate(
+                    boundary_up, size=(H, W), mode="bilinear", align_corners=False
+                )
+
+        return {
+            "pred": logit,
+            "feat": refined,
+            "domain_logit": domain_logit,
+            "proto_logit": proto_logit,
+            "boundary": boundary_up,
+        }
 
 
 __all__ = [
@@ -613,4 +724,6 @@ __all__ = [
     "HeavyDecoder",
     "EnhancedMLPDecoder",
     "PrototypeChangeHead",
+    "BoundaryDecoder",
+    "DepthwiseSeparableConv",
 ]

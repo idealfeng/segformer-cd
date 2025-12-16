@@ -1,6 +1,6 @@
 """
 python train_dino_head.py --data_root data/LEVIR-CD --out_dir outputs/dino_head_cd --device auto --epochs 100 --batch_size 8 --crop_size 256 --bce_weight 0.5 --dice_weight 0.5 --thr_mode fixed --thr 0.5
-
+--boundary_dim 192 --boundary_weight 0.5 --boundary_dilation 3
 """
 
 import argparse
@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--grad_accum", type=int, default=base.grad_accum)
     parser.add_argument("--bce_weight", type=float, default=base.bce_weight)
     parser.add_argument("--dice_weight", type=float, default=base.dice_weight)
+    parser.add_argument("--boundary_weight", type=float, default=base.boundary_weight, help="aux boundary loss weight")
+    parser.add_argument("--boundary_dilation", type=int, default=base.boundary_dilation, help="boundary thickness (px) for supervision")
     parser.add_argument("--lambda_consis", type=float, default=base.lambda_consis, help="counterfactual consistency weight")
     parser.add_argument("--lambda_domain", type=float, default=base.lambda_domain, help="domain confusion weight")
     parser.add_argument("--self_sup_weight", type=float, default=base.self_sup_weight, help="aux supervised weight on perturbed view")
@@ -66,6 +68,7 @@ def parse_args():
     parser.add_argument("--use_style_norm", action="store_true", default=base.use_style_norm)
     parser.add_argument("--proto_path", type=str, default=base.proto_path, help="npy path for prototype vectors [K,C]")
     parser.add_argument("--proto_weight", type=float, default=base.proto_weight, help="weight for prototype change logit")
+    parser.add_argument("--boundary_dim", type=int, default=base.boundary_dim, help="embed dim for boundary decoder")
     parser.add_argument("--full_eval", dest="full_eval", action="store_true")
     parser.add_argument("--no_full_eval", dest="full_eval", action="store_false")
     parser.set_defaults(full_eval=base.full_eval)
@@ -98,6 +101,8 @@ def parse_args():
         grad_accum=args.grad_accum,
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,
+        boundary_weight=args.boundary_weight,
+        boundary_dilation=args.boundary_dilation,
         lambda_consis=args.lambda_consis,
         lambda_domain=args.lambda_domain,
         self_sup_weight=args.self_sup_weight,
@@ -122,6 +127,7 @@ def parse_args():
         use_style_norm=args.use_style_norm,
         proto_path=args.proto_path,
         proto_weight=args.proto_weight,
+        boundary_dim=args.boundary_dim,
         save_best=args.save_best,
         save_last=args.save_last,
         vis_every=args.vis_every,
@@ -152,6 +158,7 @@ def main():
         use_style_norm=cfg.use_style_norm,
         proto_path=cfg.proto_path,
         proto_weight=cfg.proto_weight,
+        boundary_dim=cfg.boundary_dim,
     ).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -187,6 +194,7 @@ def main():
     print(f"dataset sizes: train={len(train_loader.dataset)} val={len(val_loader.dataset)} test={len(test_loader.dataset)}")
     print(f"epochs={cfg.epochs} batch={cfg.batch_size} crop={cfg.crop_size} grad_accum={cfg.grad_accum}")
     print(f"dino={cfg.dino_name} fuse={cfg.fuse_mode} whiten={cfg.use_whiten}")
+    print(f"loss weights: bce={cfg.bce_weight} dice={cfg.dice_weight} boundary={cfg.boundary_weight} (dilation={cfg.boundary_dilation})")
     print(f"eval: full_eval={cfg.full_eval} thr_mode={cfg.thr_mode} thr={cfg.thr} topk={cfg.topk} smooth_k={cfg.smooth_k}")
     print(f"minarea: {cfg.use_minarea} (min_area={cfg.min_area})")
     print("==========================\n")
@@ -199,6 +207,8 @@ def main():
             device=device,
             bce_w=cfg.bce_weight,
             dice_w=cfg.dice_weight,
+            boundary_w=cfg.boundary_weight,
+            boundary_dilation=cfg.boundary_dilation,
             grad_accum=cfg.grad_accum,
             log_every=cfg.log_every,
             lambda_consis=cfg.lambda_consis,

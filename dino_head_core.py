@@ -158,6 +158,28 @@ def dice_loss_with_logits(logits: torch.Tensor, target: torch.Tensor, eps: float
     return 1.0 - dice.mean()
 
 
+def mask_to_boundary(mask: torch.Tensor, dilation: int = 3) -> torch.Tensor:
+    """
+    Extract binary boundary map from a 1/0 mask using Sobel gradients + dilation.
+    """
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(1)
+    m = mask.float()
+    if m.max() > 1:
+        m = (m > 0).float()
+    device = m.device
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device, dtype=m.dtype).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=device, dtype=m.dtype).view(1, 1, 3, 3)
+    gx = F.conv2d(m, kx, padding=1)
+    gy = F.conv2d(m, ky, padding=1)
+    g = torch.sqrt(gx * gx + gy * gy)
+    boundary = (g > 0).float()
+    if dilation and dilation > 1:
+        pad = dilation // 2
+        boundary = F.max_pool2d(boundary, kernel_size=dilation, stride=1, padding=pad)
+    return boundary.clamp(0, 1)
+
+
 @dataclass
 class HeadCfg:
     data_root: str = str(_cfg_value("DATA_ROOT", Path("data/LEVIR-CD")))
@@ -175,6 +197,8 @@ class HeadCfg:
     grad_accum: int = int(_cfg_value("GRADIENT_ACCUMULATION_STEPS", 2))
     bce_weight: float = float(_cfg_value("LOSS_WEIGHT_BCE", 1.0))
     dice_weight: float = float(_cfg_value("LOSS_WEIGHT_DICE", 1.0))
+    boundary_weight: float = 0.0
+    boundary_dilation: int = 3
     lambda_consis: float = 0.0  # counterfactual consistency weight
     lambda_domain: float = 0.0  # domain confusion weight
     self_sup_weight: float = 0.0  # auxiliary supervised weight on augmented view
@@ -202,6 +226,7 @@ class HeadCfg:
     use_style_norm: bool = False
     proto_path: str = ""
     proto_weight: float = 0.0
+    boundary_dim: int = 0
 
     # saving / logging
     save_best: bool = True
@@ -291,6 +316,8 @@ def train_one_epoch(
     device: str,
     bce_w: float,
     dice_w: float,
+    boundary_w: float,
+    boundary_dilation: int,
     grad_accum: int,
     log_every: int,
     lambda_consis: float = 0.0,
@@ -313,6 +340,9 @@ def train_one_epoch(
         elif label.ndim == 4 and label.shape[1] != 1:
             label = label[:, :1]
         label = label.float()
+        boundary_gt = None
+        if boundary_w > 0:
+            boundary_gt = mask_to_boundary(label, dilation=boundary_dilation)
         with torch.cuda.amp.autocast(enabled=(device.startswith("cuda") and torch.cuda.is_available())):
             out = model(img_a, img_b)
             logits = out["pred"] if isinstance(out, dict) else out
@@ -320,6 +350,9 @@ def train_one_epoch(
             loss_bce = bce(logits, label)
             loss_dice = dice_loss_with_logits(logits, label)
             loss = (bce_w * loss_bce + dice_w * loss_dice) / grad_accum
+            if boundary_w > 0 and isinstance(out, dict) and out.get("boundary") is not None:
+                b_logit = out["boundary"]
+                loss = loss + boundary_w * bce(b_logit, boundary_gt) / grad_accum
 
             do_cf = style_aug_prob > 0 and (lambda_consis > 0 or lambda_domain > 0 or self_sup_weight > 0)
             if do_cf and torch.rand(1, device=img_a.device).item() < style_aug_prob:
@@ -333,6 +366,8 @@ def train_one_epoch(
                     cf_bce = bce(logits_cf, label)
                     cf_dice = dice_loss_with_logits(logits_cf, label)
                     loss = loss + self_sup_weight * (cf_bce + cf_dice) / grad_accum
+                if boundary_w > 0 and isinstance(out_cf, dict) and out_cf.get("boundary") is not None:
+                    loss = loss + boundary_w * bce(out_cf["boundary"], boundary_gt) / grad_accum
 
                 if lambda_consis > 0:
                     loss = loss + lambda_consis * F.l1_loss(prob, prob_cf) / grad_accum
@@ -538,5 +573,6 @@ __all__ = [
     "sliding_window_inference",
     "threshold_map",
     "filter_small_cc",
+    "mask_to_boundary",
     "build_scheduler",
 ]
