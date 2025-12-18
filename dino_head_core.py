@@ -205,6 +205,8 @@ class HeadCfg:
     style_aug_prob: float = 0.0
     style_aug_sigma: float = 0.2
     style_blur_prob: float = 0.3
+    head_aux_weight: float = 0.25
+    head_cons_weight: float = 0.0
 
     # eval
     full_eval: bool = False  # fast eval by default; enable full_eval via CLI if needed
@@ -215,6 +217,7 @@ class HeadCfg:
     smooth_k: int = 3
     use_minarea: bool = False
     min_area: int = 256
+    use_ensemble_pred: bool = False
 
     # model
     dino_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
@@ -227,6 +230,8 @@ class HeadCfg:
     proto_path: str = ""
     proto_weight: float = 0.0
     boundary_dim: int = 0
+    use_layer_ensemble: bool = False
+    layer_head_ch: int = 128
 
     # saving / logging
     save_best: bool = True
@@ -263,6 +268,48 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: HeadCfg):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def _ensemble_prob_from_logits_all(
+    logits_all: torch.Tensor, ensemble_cfg: Optional[Dict] = None
+) -> torch.Tensor:
+    """
+    logits_all: [K,B,1,H,W]
+    returns prob: [B,1,H,W]
+    """
+    cfg = ensemble_cfg or {}
+    mode = str(cfg.get("mode", "mean_prob"))
+    indices = cfg.get("indices")
+    weights = cfg.get("weights")
+
+    if indices is not None:
+        idx = torch.as_tensor(indices, device=logits_all.device, dtype=torch.long)
+        logits_all = logits_all.index_select(0, idx)
+
+    if mode == "mean_prob":
+        return torch.sigmoid(logits_all).mean(dim=0)
+    if mode == "mean_logit":
+        return torch.sigmoid(logits_all.mean(dim=0))
+    if mode == "weighted_logit":
+        if weights is None:
+            raise ValueError("ensemble_cfg.mode='weighted_logit' requires ensemble_cfg['weights']")
+        w = torch.as_tensor(weights, device=logits_all.device, dtype=logits_all.dtype)
+        if w.ndim != 1 or w.numel() != logits_all.shape[0]:
+            raise ValueError(
+                f"weights must be shape [K'] matching selected heads, got {tuple(w.shape)} vs K'={logits_all.shape[0]}"
+            )
+        w = w / w.sum().clamp_min(1e-12)
+        w = w.view(-1, 1, 1, 1, 1)
+        return torch.sigmoid((w * logits_all).sum(dim=0))
+    raise ValueError(f"Unknown ensemble mode: {mode}")
+
+
+def _prob_from_out(out, use_ensemble: bool = False, ensemble_cfg: Optional[Dict] = None) -> torch.Tensor:
+    if isinstance(out, dict):
+        if use_ensemble and out.get("logits_all") is not None:
+            return _ensemble_prob_from_logits_all(out["logits_all"], ensemble_cfg=ensemble_cfg)
+        return torch.sigmoid(out["pred"])
+    return torch.sigmoid(out)
+
+
 @torch.no_grad()
 def sliding_window_inference(
     model: nn.Module,
@@ -271,6 +318,8 @@ def sliding_window_inference(
     window: int,
     stride: int,
     device: str,
+    use_ensemble: bool = False,
+    ensemble_cfg: Optional[Dict] = None,
 ) -> torch.Tensor:
     """
     Sliding-window inference for large images.
@@ -279,8 +328,7 @@ def sliding_window_inference(
     _, _, H, W = img_a.shape
     if H <= window and W <= window:
         out = model(img_a, img_b)
-        logits = out["pred"] if isinstance(out, dict) else out
-        return torch.sigmoid(logits)
+        return _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
 
     prob_sum = torch.zeros((1, 1, H, W), device=device)
     count_map = torch.zeros((1, 1, H, W), device=device)
@@ -296,8 +344,7 @@ def sliding_window_inference(
             patch_b = img_b[..., y_start:y_end, x_start:x_end]
 
             out = model(patch_a, patch_b)
-            logits = out["pred"] if isinstance(out, dict) else out
-            prob = torch.sigmoid(logits)  # (1,1,h,w)
+            prob = _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)  # (1,1,h,w)
 
             prob_sum[..., y_start:y_end, x_start:x_end] += prob
             count_map[..., y_start:y_end, x_start:x_end] += 1
@@ -305,6 +352,58 @@ def sliding_window_inference(
     prob = prob_sum / count_map.clamp_min(1e-6)
     return prob
 
+
+@torch.no_grad()
+def sliding_window_inference_probs_all(
+    model: nn.Module,
+    img_a: torch.Tensor,
+    img_b: torch.Tensor,
+    window: int,
+    stride: int,
+    device: str,
+) -> torch.Tensor:
+    """
+    Returns probs_all [K,B,1,H,W] from model's logits_all, with sliding-window stitching if needed.
+    Note: sliding-window path assumes B==1.
+    """
+    B, _, H, W = img_a.shape
+    if H <= window and W <= window:
+        out = model(img_a, img_b)
+        if not isinstance(out, dict) or out.get("logits_all") is None:
+            raise RuntimeError("Model output has no logits_all; enable use_layer_ensemble during training/eval.")
+        return torch.sigmoid(out["logits_all"])
+
+    if B != 1:
+        raise ValueError("sliding_window_inference_probs_all currently supports B==1 only.")
+
+    prob_sum = None  # [K,1,H,W]
+    count_map = torch.zeros((1, 1, H, W), device=device)
+
+    for y in range(0, H, stride):
+        for x in range(0, W, stride):
+            y_end = min(y + window, H)
+            x_end = min(x + window, W)
+            y_start = max(0, y_end - window)
+            x_start = max(0, x_end - window)
+
+            patch_a = img_a[..., y_start:y_end, x_start:x_end]
+            patch_b = img_b[..., y_start:y_end, x_start:x_end]
+
+            out = model(patch_a, patch_b)
+            if not isinstance(out, dict) or out.get("logits_all") is None:
+                raise RuntimeError("Model output has no logits_all; enable use_layer_ensemble during training/eval.")
+            probs_all = torch.sigmoid(out["logits_all"])  # [K,1,1,h,w]
+
+            if prob_sum is None:
+                K = probs_all.shape[0]
+                prob_sum = torch.zeros((K, 1, H, W), device=device)
+
+            prob_patch = probs_all[:, 0]  # [K,1,h,w]
+            prob_sum[..., y_start:y_end, x_start:x_end] += prob_patch
+            count_map[..., y_start:y_end, x_start:x_end] += 1
+
+    probs_all = prob_sum / count_map.clamp_min(1e-6)  # [K,1,H,W]
+    return probs_all.unsqueeze(1)  # [K,1,1,H,W]
 
 from models.dinov2_head import DinoSiameseHead
 
@@ -326,6 +425,8 @@ def train_one_epoch(
     style_aug_prob: float = 0.0,
     style_aug_sigma: float = 0.2,
     style_blur_prob: float = 0.3,
+    head_aux_weight: float = 0.0,
+    head_cons_weight: float = 0.0,
 ):
     model.train()
     bce = nn.BCEWithLogitsLoss()
@@ -353,6 +454,21 @@ def train_one_epoch(
             if boundary_w > 0 and isinstance(out, dict) and out.get("boundary") is not None:
                 b_logit = out["boundary"]
                 loss = loss + boundary_w * bce(b_logit, boundary_gt) / grad_accum
+            if isinstance(out, dict) and out.get("logits_all") is not None:
+                logits_all = out["logits_all"]
+                if logits_all.ndim == 5 and logits_all.shape[0] > 1:
+                    head_loss = torch.tensor(0.0, device=logits_all.device)
+                    for k in range(logits_all.shape[0] - 1):
+                        loss_bce_k = bce(logits_all[k], label)
+                        loss_dice_k = dice_loss_with_logits(logits_all[k], label)
+                        head_loss = head_loss + (bce_w * loss_bce_k + dice_w * loss_dice_k)
+                    if head_aux_weight > 0:
+                        loss = loss + head_aux_weight * head_loss / grad_accum
+                    if head_cons_weight > 0:
+                        prob_all = torch.sigmoid(logits_all)
+                        prob_mean = prob_all.mean(dim=0)
+                        cons_loss = ((prob_all - prob_mean.unsqueeze(0)) ** 2).mean()
+                        loss = loss + head_cons_weight * cons_loss / grad_accum
 
             do_cf = style_aug_prob > 0 and (lambda_consis > 0 or lambda_domain > 0 or self_sup_weight > 0)
             if do_cf and torch.rand(1, device=img_a.device).item() < style_aug_prob:
@@ -411,6 +527,8 @@ def evaluate(
     print_every: int = 0,
     window: int = 256,
     stride: int = 256,
+    use_ensemble: bool = False,
+    ensemble_cfg: Optional[Dict] = None,
 ) -> Dict[str, float]:
     model.eval()
     cm = {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
@@ -426,11 +544,12 @@ def evaluate(
                 window=window,
                 stride=stride,
                 device=device,
+                use_ensemble=use_ensemble,
+                ensemble_cfg=ensemble_cfg,
             )
         else:
             out = model(img_a, img_b)
-            logits = out["pred"] if isinstance(out, dict) else out
-            prob = torch.sigmoid(logits)
+            prob = _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
         if smooth_k and smooth_k > 1:
             pad = smooth_k // 2
             prob = F.avg_pool2d(prob, kernel_size=smooth_k, stride=1, padding=pad)
@@ -459,6 +578,8 @@ def save_vis_samples(
     smooth_k: int,
     window: Optional[int] = None,
     stride: Optional[int] = None,
+    use_ensemble: bool = False,
+    ensemble_cfg: Optional[Dict] = None,
 ):
     import matplotlib.pyplot as plt
     ensure_dir(out_dir)
@@ -479,11 +600,12 @@ def save_vis_samples(
                 window=window,
                 stride=stride,
                 device=device,
+                use_ensemble=use_ensemble,
+                ensemble_cfg=ensemble_cfg,
             )
         else:
             out = model(img_a, img_b)
-            logits = out["pred"] if isinstance(out, dict) else out
-            prob = torch.sigmoid(logits)
+            prob = _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
         if smooth_k and smooth_k > 1:
             pad = smooth_k // 2
             prob = F.avg_pool2d(prob, kernel_size=smooth_k, stride=1, padding=pad)
@@ -571,6 +693,7 @@ __all__ = [
     "evaluate",
     "save_vis_samples",
     "sliding_window_inference",
+    "sliding_window_inference_probs_all",
     "threshold_map",
     "filter_small_cc",
     "mask_to_boundary",

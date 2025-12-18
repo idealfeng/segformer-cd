@@ -1,5 +1,5 @@
 """
-python train_dino_head.py --data_root data/LEVIR-CD --out_dir outputs/dino_head_cd --device auto --epochs 100 --batch_size 8 --crop_size 256 --bce_weight 0.5 --dice_weight 0.5 --thr_mode fixed --thr 0.5
+python train_dino_head.py --data_root data/WHUCD --out_dir outputs/dino_head_cd --device auto --epochs 100 --batch_size 8 --crop_size 256 --bce_weight 0.5 --dice_weight 0.5 --thr_mode fixed --thr 0.5
 --boundary_dim 192 --boundary_weight 0.5 --boundary_dilation 3
 """
 
@@ -48,6 +48,8 @@ def parse_args():
     parser.add_argument("--style_aug_prob", type=float, default=base.style_aug_prob, help="probability to apply style perturbation")
     parser.add_argument("--style_aug_sigma", type=float, default=base.style_aug_sigma, help="noise scale for style perturbation")
     parser.add_argument("--style_blur_prob", type=float, default=base.style_blur_prob, help="blur probability for style perturbation")
+    parser.add_argument("--head_aux_weight", type=float, default=base.head_aux_weight, help="aux supervision weight for layer heads")
+    parser.add_argument("--head_cons_weight", type=float, default=base.head_cons_weight, help="consistency weight across layer heads")
     parser.add_argument("--eval_crop", type=int, default=base.eval_crop)
     parser.add_argument("--window", type=int, default=base.eval_window, help="滑窗窗口（默认不用滑窗）")
     parser.add_argument("--stride", type=int, default=base.eval_stride, help="滑窗步长（需与window同时设置）")
@@ -59,6 +61,7 @@ def parse_args():
     parser.add_argument("--vis_every", type=int, default=base.vis_every)
     parser.add_argument("--vis_n", type=int, default=base.vis_n)
     parser.add_argument("--log_every", type=int, default=base.log_every)
+    parser.add_argument("--use_ensemble_pred", action="store_true", default=base.use_ensemble_pred, help="use ensemble mean for eval/vis")
     parser.add_argument("--dino_name", type=str, default=base.dino_name)
     parser.add_argument("--fuse_mode", type=str, choices=["abs", "abs+sum", "cat4"], default=base.fuse_mode)
     parser.add_argument("--use_whiten", action="store_true", default=base.use_whiten)
@@ -69,6 +72,8 @@ def parse_args():
     parser.add_argument("--proto_path", type=str, default=base.proto_path, help="npy path for prototype vectors [K,C]")
     parser.add_argument("--proto_weight", type=float, default=base.proto_weight, help="weight for prototype change logit")
     parser.add_argument("--boundary_dim", type=int, default=base.boundary_dim, help="embed dim for boundary decoder")
+    parser.add_argument("--use_layer_ensemble", action="store_true", default=base.use_layer_ensemble, help="enable layer-wise ensemble heads")
+    parser.add_argument("--layer_head_ch", type=int, default=base.layer_head_ch, help="channel width for fused ensemble head")
     parser.add_argument("--full_eval", dest="full_eval", action="store_true")
     parser.add_argument("--no_full_eval", dest="full_eval", action="store_false")
     parser.set_defaults(full_eval=base.full_eval)
@@ -109,6 +114,8 @@ def parse_args():
         style_aug_prob=args.style_aug_prob,
         style_aug_sigma=args.style_aug_sigma,
         style_blur_prob=args.style_blur_prob,
+        head_aux_weight=args.head_aux_weight,
+        head_cons_weight=args.head_cons_weight,
         full_eval=args.full_eval,
         eval_crop=args.eval_crop,
         eval_window=args.window,
@@ -119,6 +126,7 @@ def parse_args():
         smooth_k=args.smooth_k,
         use_minarea=args.use_minarea,
         min_area=args.min_area,
+        use_ensemble_pred=args.use_ensemble_pred,
         dino_name=args.dino_name,
         use_whiten=args.use_whiten,
         use_domain_adv=args.use_domain_adv,
@@ -128,6 +136,8 @@ def parse_args():
         proto_path=args.proto_path,
         proto_weight=args.proto_weight,
         boundary_dim=args.boundary_dim,
+        use_layer_ensemble=args.use_layer_ensemble,
+        layer_head_ch=args.layer_head_ch,
         save_best=args.save_best,
         save_last=args.save_last,
         vis_every=args.vis_every,
@@ -159,6 +169,8 @@ def main():
         proto_path=cfg.proto_path,
         proto_weight=cfg.proto_weight,
         boundary_dim=cfg.boundary_dim,
+        use_layer_ensemble=cfg.use_layer_ensemble,
+        layer_head_ch=cfg.layer_head_ch,
     ).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -217,6 +229,8 @@ def main():
             style_aug_prob=cfg.style_aug_prob,
             style_aug_sigma=cfg.style_aug_sigma,
             style_blur_prob=cfg.style_blur_prob,
+            head_aux_weight=cfg.head_aux_weight,
+            head_cons_weight=cfg.head_cons_weight,
         )
         do_eval = (ep % eval_every == 0) or (ep == cfg.epochs)
         if do_eval:
@@ -233,6 +247,8 @@ def main():
                 print_every=0,
                 window=cfg.eval_window,
                 stride=cfg.eval_stride,
+                use_ensemble=cfg.use_ensemble_pred,
+                ensemble_cfg=None,
             )
             print(
                 f"[Epoch {ep:03d}] VAL  "
@@ -286,6 +302,8 @@ def main():
                 smooth_k=cfg.smooth_k,
                 window=cfg.eval_window,
                 stride=cfg.eval_stride,
+                use_ensemble=cfg.use_ensemble_pred,
+                ensemble_cfg=None,
             )
             print(f"  -> Saved VIS {vis_dir}")
     if os.path.exists(best_path):
@@ -305,6 +323,8 @@ def main():
         print_every=max(1, len(test_loader) // 5),
         window=cfg.eval_window,
         stride=cfg.eval_stride,
+        use_ensemble=cfg.use_ensemble_pred,
+        ensemble_cfg=None,
     )
     print("\n====== Final Metrics (Test) ======")
     print(f"THR_MODE={cfg.thr_mode} | TOPK={cfg.topk} | FIXED_THR={cfg.thr}")

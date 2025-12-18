@@ -157,6 +157,27 @@ class HeavyDecoder(nn.Module):
         return self.refine(u1)
 
 
+class LayerHead(nn.Module):
+    """Per-layer prediction head for ensemble logits."""
+
+    def __init__(self, in_ch: int, base_ch: int = 64, norm: str = "gn"):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, base_ch, 3, padding=1, bias=False),
+            norm2d(norm, base_ch),
+            nn.GELU(),
+            nn.Conv2d(base_ch, base_ch, 3, padding=1, bias=False),
+            norm2d(norm, base_ch),
+            nn.GELU(),
+        )
+        self.classifier = nn.Conv2d(base_ch, 1, 1)
+
+    def forward(self, x: torch.Tensor, out_size: Tuple[int, int]) -> torch.Tensor:
+        x = self.conv(x)
+        x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return self.classifier(x)
+
+
 class ChannelAttention(nn.Module):
     """Channel attention (SE-style)."""
 
@@ -432,6 +453,8 @@ class DinoSiameseHead(nn.Module):
         proto_path: str = None,
         proto_weight: float = 0.0,
         boundary_dim: int = 0,
+        use_layer_ensemble: bool = False,
+        layer_head_ch: int = 128,
     ):
         super().__init__()
         self.patch = int(patch)
@@ -448,6 +471,8 @@ class DinoSiameseHead(nn.Module):
         self.proto_path = proto_path
         self.proto_weight = float(proto_weight)
         self.boundary_dim = int(boundary_dim)
+        self.use_layer_ensemble = bool(use_layer_ensemble)
+        self.layer_head_ch = int(layer_head_ch)
 
         self.use_hf = "dinov3" in dino_name.lower() or dino_name.startswith(
             "facebook/dinov3"
@@ -507,6 +532,31 @@ class DinoSiameseHead(nn.Module):
         self.domain_head = DomainDiscriminator(embed_dim, domain_hidden) if self.use_domain_adv else None
 
         self.classifier = nn.Conv2d(self.mlp_decoder.out_channels, 1, 1)
+
+        self.layer_heads = None
+        self.fused_decoder = None
+        self.fused_head = None
+        self.fused_classifier = None
+        if self.use_layer_ensemble:
+            self.layer_heads = nn.ModuleList(
+                [
+                    LayerHead(
+                        self.adapter_dim,
+                        base_ch=max(16, self.layer_head_ch // 2),
+                        norm=self.norm,
+                    )
+                    for _ in self.selected_layers
+                ]
+            )
+            self.fused_decoder = MultiScaleFusionDecoder(
+                in_channels_list=[self.adapter_dim] * len(self.selected_layers),
+                embed_dim=self.layer_head_ch,
+                norm=self.norm,
+            )
+            self.fused_head = HeavyDecoder(
+                in_ch=self.layer_head_ch, base_ch=self.layer_head_ch, norm=self.norm
+            )
+            self.fused_classifier = nn.Conv2d(self.layer_head_ch, 1, 1)
 
         self.boundary_head = None
         self.boundary_refine = None
@@ -643,6 +693,7 @@ class DinoSiameseHead(nn.Module):
             )
 
         diff_feats = []
+        logits_list = []
         deep_fa = None
         deep_fb = None
         for i, (fa, fb, dm) in enumerate(zip(fa_list, fb_list, self.diff_modules)):
@@ -653,7 +704,10 @@ class DinoSiameseHead(nn.Module):
             if i == len(self.diff_modules) - 1:
                 deep_fa = fa
                 deep_fb = fb
-            diff_feats.append(dm(fa, fb))
+            diff = dm(fa, fb)
+            diff_feats.append(diff)
+            if self.layer_heads is not None:
+                logits_list.append(self.layer_heads[i](diff, out_size=(H, W)))
 
         fused = self.decoder(diff_feats)  # [B, embed_dim, h, w]
         if self.use_style_norm:
@@ -696,6 +750,36 @@ class DinoSiameseHead(nn.Module):
                 logit, size=(H, W), mode="bilinear", align_corners=False
             )
 
+        proto_up = None
+        if proto_logit is not None:
+            proto_up = F.interpolate(
+                proto_logit, size=(Hp, Wp), mode="bilinear", align_corners=False
+            )
+            proto_up = proto_up[..., :H0, :W0]
+            if proto_up.shape[-2:] != (H, W):
+                proto_up = F.interpolate(
+                    proto_up, size=(H, W), mode="bilinear", align_corners=False
+                )
+
+        logits_all = None
+        pred_logit = logit
+        if self.layer_heads is not None:
+            fused = self.fused_decoder(diff_feats)
+            fused = self.fused_head(fused)
+            fused_logit = self.fused_classifier(fused)
+            fused_logit = F.interpolate(
+                fused_logit, size=(Hp, Wp), mode="bilinear", align_corners=False
+            )
+            fused_logit = fused_logit[..., :H0, :W0]
+            if fused_logit.shape[-2:] != (H, W):
+                fused_logit = F.interpolate(
+                    fused_logit, size=(H, W), mode="bilinear", align_corners=False
+                )
+            if proto_up is not None:
+                fused_logit = fused_logit + proto_up
+            logits_all = torch.stack(logits_list + [fused_logit], dim=0)
+            pred_logit = fused_logit
+
         boundary_up = None
         if boundary_logit is not None:
             boundary_up = F.interpolate(
@@ -708,11 +792,12 @@ class DinoSiameseHead(nn.Module):
                 )
 
         return {
-            "pred": logit,
+            "pred": pred_logit,
             "feat": refined,
             "domain_logit": domain_logit,
             "proto_logit": proto_logit,
             "boundary": boundary_up,
+            "logits_all": logits_all,
         }
 
 
@@ -722,6 +807,7 @@ __all__ = [
     "DifferenceModule",
     "MultiScaleFusionDecoder",
     "HeavyDecoder",
+    "LayerHead",
     "EnhancedMLPDecoder",
     "PrototypeChangeHead",
     "BoundaryDecoder",
