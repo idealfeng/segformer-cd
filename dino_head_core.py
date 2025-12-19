@@ -405,6 +405,59 @@ def sliding_window_inference_probs_all(
     probs_all = prob_sum / count_map.clamp_min(1e-6)  # [K,1,H,W]
     return probs_all.unsqueeze(1)  # [K,1,1,H,W]
 
+
+@torch.no_grad()
+def sliding_window_inference_logits_all(
+    model: nn.Module,
+    img_a: torch.Tensor,
+    img_b: torch.Tensor,
+    window: int,
+    stride: int,
+    device: str,
+) -> torch.Tensor:
+    """
+    Returns logits_all [K,B,1,H,W] from model's logits_all, with sliding-window stitching if needed.
+    Note: sliding-window path assumes B==1.
+    """
+    B, _, H, W = img_a.shape
+    if H <= window and W <= window:
+        out = model(img_a, img_b)
+        if not isinstance(out, dict) or out.get("logits_all") is None:
+            raise RuntimeError("Model output has no logits_all; enable use_layer_ensemble during training/eval.")
+        return out["logits_all"]
+
+    if B != 1:
+        raise ValueError("sliding_window_inference_logits_all currently supports B==1 only.")
+
+    logit_sum = None  # [K,1,H,W]
+    count_map = torch.zeros((1, 1, H, W), device=device)
+
+    for y in range(0, H, stride):
+        for x in range(0, W, stride):
+            y_end = min(y + window, H)
+            x_end = min(x + window, W)
+            y_start = max(0, y_end - window)
+            x_start = max(0, x_end - window)
+
+            patch_a = img_a[..., y_start:y_end, x_start:x_end]
+            patch_b = img_b[..., y_start:y_end, x_start:x_end]
+
+            out = model(patch_a, patch_b)
+            if not isinstance(out, dict) or out.get("logits_all") is None:
+                raise RuntimeError("Model output has no logits_all; enable use_layer_ensemble during training/eval.")
+            logits_all = out["logits_all"]  # [K,1,1,h,w]
+
+            if logit_sum is None:
+                K = logits_all.shape[0]
+                logit_sum = torch.zeros((K, 1, H, W), device=device)
+
+            logit_patch = logits_all[:, 0]  # [K,1,h,w]
+            logit_sum[..., y_start:y_end, x_start:x_end] += logit_patch
+            count_map[..., y_start:y_end, x_start:x_end] += 1
+
+    logits_all = logit_sum / count_map.clamp_min(1e-6)  # [K,1,H,W]
+    return logits_all.unsqueeze(1)  # [K,1,1,H,W]
+
 from models.dinov2_head import DinoSiameseHead
 
 def train_one_epoch(

@@ -17,6 +17,7 @@ from dino_head_core import (
     seed_everything,
     evaluate,
     save_vis_samples,
+    sliding_window_inference_logits_all,
     sliding_window_inference_probs_all,
     threshold_map,
     filter_small_cc,
@@ -37,6 +38,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate DINOv2 change-detection head")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint (best.pt/last.pt)")
     parser.add_argument("--data_root", type=str, default=base.data_root)
+    parser.add_argument(
+        "--calib_root",
+        type=str,
+        default=None,
+        help="Optional calibration data_root for selecting heads / fitting ensemble weights (e.g., source domain). If not set, uses --data_root.",
+    )
     parser.add_argument("--out_dir", type=str, default=None, help="目录为空则默认与 checkpoint 同级")
     parser.add_argument("--device", type=str, default=base.device, help="cuda|cpu|auto")
     parser.add_argument("--batch_size", type=int, default=2, help="Eval batch size (use 1 for full images)")
@@ -56,8 +63,14 @@ def parse_args():
         "--ensemble_strategy",
         type=str,
         default="mean_prob",
-        choices=["mean_prob", "mean_logit", "topk", "weighted_logit"],
+        choices=["mean_prob", "mean_logit", "topk", "weighted_logit", "cvx_nll"],
         help="Ensemble strategy when --use_ensemble_pred is set",
+    )
+    parser.add_argument(
+        "--ensemble_indices",
+        type=str,
+        default=None,
+        help="Optional comma-separated head indices to use (e.g., '3,4'). Overrides topk selection.",
     )
     parser.add_argument(
         "--ensemble_topk",
@@ -78,6 +91,17 @@ def parse_args():
         default=1.0,
         help="Softmax temperature for weighted_logit (smaller -> more peaky)",
     )
+    parser.add_argument("--cvx_lambda", type=float, default=1e-3, help="L2 regularization for cvx_nll weights (ensures unique optimum)")
+    parser.add_argument("--cvx_steps", type=int, default=200, help="Optimization steps for cvx_nll")
+    parser.add_argument("--cvx_lr", type=float, default=0.5, help="Step size for projected gradient descent (cvx_nll)")
+    parser.add_argument("--cvx_max_pixels", type=int, default=400000, help="Max sampled pixels from val for cvx_nll")
+    parser.add_argument(
+        "--cvx_pos_weight",
+        type=str,
+        default="auto",
+        choices=["auto", "none"],
+        help="Use pos_weight for BCE in cvx_nll (auto uses neg/pos from sampled pixels)",
+    )
     parser.add_argument("--vis", action="store_true", help="Save visualization samples")
     parser.add_argument("--vis_n", type=int, default=base.vis_n)
     parser.add_argument("--vis_dir", type=str, default=None)
@@ -95,6 +119,13 @@ def parse_args():
         help="滑窗步长，默认等于 window",
     )
     args = parser.parse_args()
+    if args.ensemble_indices:
+        try:
+            args.ensemble_indices = [int(x) for x in str(args.ensemble_indices).split(",") if str(x).strip() != ""]
+        except Exception:
+            raise ValueError("--ensemble_indices must be a comma-separated list of ints, e.g. '3,4'")
+        if len(args.ensemble_indices) <= 0:
+            args.ensemble_indices = None
     if (args.ensemble_strategy != "mean_prob") and (not args.use_ensemble_pred):
         print("[Ensemble] Detected --ensemble_strategy != mean_prob; auto-enabling --use_ensemble_pred.")
         args.use_ensemble_pred = True
@@ -120,6 +151,149 @@ def parse_args():
     if args.stride is not None and args.stride <= 0:
         args.stride = None
     return args, cfg
+
+
+def _project_simplex(v: torch.Tensor) -> torch.Tensor:
+    """
+    Euclidean projection of v onto the probability simplex {w>=0, sum w = 1}.
+    v: 1D tensor
+    """
+    if v.ndim != 1:
+        raise ValueError("project_simplex expects 1D tensor")
+    n = v.numel()
+    if n == 1:
+        return torch.ones_like(v)
+    u, _ = torch.sort(v, descending=True)
+    cssv = torch.cumsum(u, dim=0) - 1
+    ind = torch.arange(1, n + 1, device=v.device, dtype=v.dtype)
+    cond = u - cssv / ind > 0
+    if not bool(cond.any()):
+        return torch.full_like(v, 1.0 / n)
+    rho = int(torch.nonzero(cond, as_tuple=False)[-1].item()) + 1
+    theta = cssv[rho - 1] / float(rho)
+    w = (v - theta).clamp_min(0.0)
+    w = w / w.sum().clamp_min(1e-12)
+    return w
+
+
+@torch.no_grad()
+def _collect_val_pixels_for_cvx(
+    model: torch.nn.Module,
+    loader,
+    device: str,
+    indices: list[int],
+    window: int | None,
+    stride: int | None,
+    max_pixels: int,
+):
+    """
+    Collect sampled pixels (logits per head, label) from val.
+    Returns:
+      logits_mat: [N, K] float32 on device
+      labels: [N] float32 on device
+    """
+    logits_buf = None
+    y_buf = None
+    max_pixels = int(max(1000, max_pixels))
+
+    for batch in loader:
+        img_a = batch["img_a"].to(device, non_blocking=True)
+        img_b = batch["img_b"].to(device, non_blocking=True)
+        gt = batch["label"].to(device)
+        if gt.ndim == 3:
+            gt = gt.unsqueeze(1)
+        if gt.ndim == 4 and gt.shape[1] != 1:
+            gt = gt[:, :1]
+        y = (gt > 0).float()  # [B,1,H,W]
+
+        if window is not None and stride is not None:
+            if img_a.shape[0] != 1:
+                raise ValueError("cvx_nll with sliding window currently supports batch_size==1.")
+            logits_all = sliding_window_inference_logits_all(
+                model=model,
+                img_a=img_a,
+                img_b=img_b,
+                window=window,
+                stride=stride,
+                device=device,
+            )  # [Kall,1,1,H,W]
+        else:
+            out = model(img_a, img_b)
+            if not isinstance(out, dict) or out.get("logits_all") is None:
+                raise RuntimeError("Model output has no logits_all; enable use_layer_ensemble during training/eval.")
+            logits_all = out["logits_all"]  # [Kall,B,1,H,W]
+
+        idx = torch.as_tensor(indices, device=logits_all.device, dtype=torch.long)
+        logits_sel = logits_all.index_select(0, idx)  # [K,B,1,H,W]
+        K, B, _, H, W = logits_sel.shape
+        logits_mat = logits_sel.permute(1, 3, 4, 0, 2).reshape(B * H * W, K)  # [N,K]
+        y_flat = y.reshape(B * H * W)  # [N]
+
+        # merge buffer with cap
+        if logits_buf is None:
+            logits_buf = logits_mat
+            y_buf = y_flat
+        else:
+            logits_buf = torch.cat([logits_buf, logits_mat], dim=0)
+            y_buf = torch.cat([y_buf, y_flat], dim=0)
+
+        if logits_buf.shape[0] > max_pixels:
+            perm = torch.randperm(logits_buf.shape[0], device=logits_buf.device)[:max_pixels]
+            logits_buf = logits_buf.index_select(0, perm)
+            y_buf = y_buf.index_select(0, perm)
+
+    if logits_buf is None or y_buf is None:
+        raise RuntimeError("Empty val loader; cannot fit cvx_nll weights.")
+    return logits_buf.to(dtype=torch.float32), y_buf.to(dtype=torch.float32)
+
+
+def _fit_cvx_nll_weights(
+    logits_mat: torch.Tensor,
+    labels: torch.Tensor,
+    l2_lambda: float,
+    steps: int,
+    lr: float,
+    pos_weight_mode: str,
+) -> torch.Tensor:
+    """
+    Solve:
+      min_{w in simplex} BCEWithLogitsLoss(sum_k w_k z_k, y) + lambda * ||w||_2^2
+    Convex in w; with lambda>0 it's strongly convex => unique optimum.
+    """
+    if logits_mat.ndim != 2:
+        raise ValueError("logits_mat must be [N,K]")
+    N, K = logits_mat.shape
+    if labels.ndim != 1 or labels.shape[0] != N:
+        raise ValueError("labels must be [N] matching logits_mat")
+    steps = int(max(50, steps))
+    lr = float(max(1e-6, lr))
+    l2_lambda = float(max(0.0, l2_lambda))
+
+    if pos_weight_mode == "auto":
+        pos = float(labels.sum().item())
+        neg = float(labels.numel() - pos)
+        if pos > 0:
+            pos_weight = torch.tensor([neg / max(1.0, pos)], device=logits_mat.device, dtype=torch.float32)
+        else:
+            pos_weight = None
+    else:
+        pos_weight = None
+
+    w = torch.full((K,), 1.0 / float(K), device=logits_mat.device, dtype=torch.float32, requires_grad=True)
+
+    for _ in range(steps):
+        z = (logits_mat * w.view(1, K)).sum(dim=1)  # [N]
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(z, labels, pos_weight=pos_weight)
+        if l2_lambda > 0:
+            loss = loss + l2_lambda * (w * w).sum()
+        loss.backward()
+        with torch.no_grad():
+            grad = w.grad
+            w_new = _project_simplex(w - lr * grad)
+            w.copy_(w_new)
+            w.grad = None
+
+    return w.detach()
 
 
 @torch.no_grad()
@@ -201,8 +375,32 @@ def main():
         device = "cpu"
         cfg.device = device
     cfg.batch_size = args.batch_size
-    # build loaders (only need val/test; train ignored)
+    # eval loaders: use --data_root
     _, val_loader, test_loader = build_dataloaders(cfg)
+    # calibration loaders: optionally use --calib_root (e.g., source domain)
+    val_loader_calib = val_loader
+    if args.calib_root:
+        cfg_calib = HeadCfg(
+            data_root=args.calib_root,
+            out_dir=cfg.out_dir,
+            device=cfg.device,
+            full_eval=cfg.full_eval,
+            eval_crop=cfg.eval_crop,
+            thr_mode=cfg.thr_mode,
+            thr=cfg.thr,
+            topk=cfg.topk,
+            smooth_k=cfg.smooth_k,
+            use_minarea=cfg.use_minarea,
+            min_area=cfg.min_area,
+            use_ensemble_pred=cfg.use_ensemble_pred,
+        )
+        cfg_calib.batch_size = cfg.batch_size
+        try:
+            _, val_loader_calib, _ = build_dataloaders(cfg_calib)
+            print(f"[Calib] Using calib_root={args.calib_root} (val size={len(val_loader_calib.dataset)})")
+        except Exception as e:
+            print(f"[Calib] Failed to build calib loaders from {args.calib_root}: {e}; fallback to --data_root val.")
+            val_loader_calib = val_loader
     ckpt = torch.load(args.checkpoint, map_location=device)
     load_cfg = ckpt.get("cfg")
     if isinstance(load_cfg, dict):
@@ -229,13 +427,16 @@ def main():
     if args.use_ensemble_pred:
         if args.ensemble_strategy in ("mean_prob", "mean_logit"):
             ensemble_cfg = {"mode": args.ensemble_strategy}
+            if args.ensemble_indices is not None:
+                ensemble_cfg["indices"] = args.ensemble_indices
+                print(f"[Ensemble] Using fixed heads indices={args.ensemble_indices} with mode={args.ensemble_strategy}")
         else:
             if not getattr(cfg, "use_layer_ensemble", False):
                 print("Warning: use_layer_ensemble=False in checkpoint cfg; logits_all may be None, ensemble will fallback to pred.")
             print("\n[Ensemble] Scoring each head on VAL to derive selection/weights...")
             head_metrics = score_heads_on_loader(
                 model=model,
-                loader=val_loader,
+                loader=val_loader_calib,
                 device=device,
                 thr_mode=cfg.thr_mode,
                 thr=cfg.thr,
@@ -254,14 +455,25 @@ def main():
                 tag = "fused" if i == fused_idx else f"layer{i}"
                 print(f"  head[{i}] ({tag}): F1={f1:.4f}")
 
-            layer_indices = list(range(0, max(0, fused_idx)))
-            if args.ensemble_topk and args.ensemble_topk > 0 and layer_indices:
-                layer_sorted = sorted(layer_indices, key=lambda i: f1s[i], reverse=True)
-                picked_layers = layer_sorted[: min(args.ensemble_topk, len(layer_sorted))]
+            if args.ensemble_indices is not None:
+                indices = [int(i) for i in args.ensemble_indices]
             else:
-                picked_layers = layer_indices
+                layer_indices = list(range(0, max(0, fused_idx)))
+                if args.ensemble_topk and args.ensemble_topk > 0 and layer_indices:
+                    layer_sorted = sorted(layer_indices, key=lambda i: f1s[i], reverse=True)
+                    picked_layers = layer_sorted[: min(args.ensemble_topk, len(layer_sorted))]
+                else:
+                    picked_layers = layer_indices
+                indices = picked_layers + [fused_idx]
 
-            indices = picked_layers + [fused_idx]
+            # validate indices
+            indices = [int(i) for i in indices]
+            if any((i < 0 or i >= K) for i in indices):
+                raise ValueError(f"--ensemble_indices out of range: got {indices}, but K={K}")
+            # ensure fused included by default
+            if (args.ensemble_indices is None) and (fused_idx not in indices):
+                indices = indices + [fused_idx]
+
             if args.ensemble_strategy == "topk":
                 ensemble_cfg = {"mode": "mean_logit", "indices": indices}
                 print(f"[Ensemble] Using mean_logit over heads indices={indices}")
@@ -276,12 +488,53 @@ def main():
                 ensemble_cfg = {"mode": "weighted_logit", "indices": indices, "weights": w}
                 print(f"[Ensemble] Using weighted_logit over heads indices={indices}")
                 print(f"[Ensemble] Weights={['{:.3f}'.format(x) for x in w]}")
+            elif args.ensemble_strategy == "cvx_nll":
+                print(f"[Ensemble] Fitting convex NLL weights on VAL (indices={indices})...")
+                logits_mat, y_flat = _collect_val_pixels_for_cvx(
+                    model=model,
+                    loader=val_loader_calib,
+                    device=device,
+                    indices=indices,
+                    window=args.window,
+                    stride=args.stride,
+                    max_pixels=args.cvx_max_pixels,
+                )
+                w = _fit_cvx_nll_weights(
+                    logits_mat=logits_mat,
+                    labels=y_flat,
+                    l2_lambda=args.cvx_lambda,
+                    steps=args.cvx_steps,
+                    lr=args.cvx_lr,
+                    pos_weight_mode=args.cvx_pos_weight,
+                ).tolist()
+                ensemble_cfg = {"mode": "weighted_logit", "indices": indices, "weights": w, "solver": "cvx_nll"}
+                print(f"[Ensemble] Using cvx_nll weighted_logit over heads indices={indices}")
+                print(f"[Ensemble] Weights={['{:.3f}'.format(x) for x in w]}")
             else:
                 raise ValueError(f"Unknown ensemble_strategy: {args.ensemble_strategy}")
             try:
                 os.makedirs(cfg.out_dir, exist_ok=True)
                 with open(os.path.join(cfg.out_dir, "ensemble_cfg.json"), "w", encoding="utf-8") as f:
-                    json.dump({"strategy": args.ensemble_strategy, "indices": indices, "f1s": f1s, "cfg": ensemble_cfg}, f, ensure_ascii=False, indent=2)
+                    json.dump(
+                        {
+                            "strategy": args.ensemble_strategy,
+                            "indices": indices,
+                            "f1s": f1s,
+                            "cfg": ensemble_cfg,
+                            "cvx": {
+                                "lambda": float(args.cvx_lambda),
+                                "steps": int(args.cvx_steps),
+                                "lr": float(args.cvx_lr),
+                                "max_pixels": int(args.cvx_max_pixels),
+                                "pos_weight": str(args.cvx_pos_weight),
+                            }
+                            if args.ensemble_strategy == "cvx_nll"
+                            else None,
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
             except Exception:
                 pass
 
