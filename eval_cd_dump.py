@@ -1,12 +1,12 @@
 """
 Unified evaluation + dump for Change Detection (SegFormer baseline)
 
-python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset levir --data-root data\LEVIR-CD --exp-name levir2levir --window 256 --stride 256 --num-vis 10
-python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset whucd --data-root data\WHUCD --exp-name levir2whu --window 256 --stride 256 --num-vis 10
-python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset whucd --data-root data\WHUCD --exp-name whu2whu --window 256 --stride 256 --num-vis 10
-python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset levir --data-root data\LEVIR-CD --exp-name whu2levir --window 256 --stride 256 --num-vis 10
+python eval_cd_dump.py --checkpoint outputs/checkpoints/best_model.pth --dataset levir --data-root data/LEVIR-CD --exp-name levir2levir --window 256 --stride 256 --num-vis 10
+python eval_cd_dump.py --checkpoint outputs/checkpoints/best_model.pth --dataset whucd --data-root data/WHUCD --exp-name levir2whu --window 256 --stride 256 --num-vis 10
+python eval_cd_dump.py --checkpoint outputs/checkpoints/best_model.pth --dataset whucd --data-root data/WHUCD --exp-name whu2whu --window 256 --stride 256 --num-vis 10
+python eval_cd_dump.py --checkpoint outputs/checkpoints/best_model.pth --dataset levir --data-root data/LEVIR-CD --exp-name whu2levir --window 256 --stride 256 --num-vis 10
 
-python eval_cd_dump.py --checkpoint outputs\checkpoints\best_model.pth --dataset levir --data-root data\LEVIR-CD --exp-name levir2levir_autoThr --window 256 --stride 256 --auto-threshold --auto-bins 512 --num-vis 10 --no-dump-all
+python eval_cd_dump.py --checkpoint outputs/checkpoints/best_model.pth --dataset levir --data-root data/LEVIR-CD --exp-name levir2levir_autoThr --window 256 --stride 256 --auto-threshold --auto-bins 512 --num-vis 10 --no-dump-all
 
 Run examples:
   # levir->levir

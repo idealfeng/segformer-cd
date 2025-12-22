@@ -105,6 +105,27 @@ def parse_args():
     parser.add_argument("--vis", action="store_true", help="Save visualization samples")
     parser.add_argument("--vis_n", type=int, default=base.vis_n)
     parser.add_argument("--vis_dir", type=str, default=None)
+    parser.add_argument("--vis_heads", action="store_true", help="Also save per-head logits/prob heatmaps when logits_all is available")
+    parser.add_argument(
+        "--vis_head_mode",
+        type=str,
+        default="logit",
+        choices=["logit", "prob"],
+        help="What to visualize for heads: raw logits (diverging colormap) or probs (jet)",
+    )
+    parser.add_argument(
+        "--vis_head_indices",
+        type=str,
+        default=None,
+        help="Optional comma-separated head indices to visualize (e.g., '3,4'). Default: all heads in logits_all.",
+    )
+    parser.add_argument(
+        "--vis_split",
+        type=str,
+        default="val",
+        choices=["val", "test"],
+        help="Which split to visualize when --vis is set",
+    )
     parser.add_argument("--print_every", type=int, default=0)
     parser.add_argument(
         "--window",
@@ -126,6 +147,13 @@ def parse_args():
             raise ValueError("--ensemble_indices must be a comma-separated list of ints, e.g. '3,4'")
         if len(args.ensemble_indices) <= 0:
             args.ensemble_indices = None
+    if args.vis_head_indices:
+        try:
+            args.vis_head_indices = [int(x) for x in str(args.vis_head_indices).split(",") if str(x).strip() != ""]
+        except Exception:
+            raise ValueError("--vis_head_indices must be a comma-separated list of ints, e.g. '3,4'")
+        if len(args.vis_head_indices) <= 0:
+            args.vis_head_indices = None
     if (args.ensemble_strategy != "mean_prob") and (not args.use_ensemble_pred):
         print("[Ensemble] Detected --ensemble_strategy != mean_prob; auto-enabling --use_ensemble_pred.")
         args.use_ensemble_pred = True
@@ -566,9 +594,10 @@ def main():
     print(f"Saved metrics to {results_path}")
     if args.vis:
         vis_dir = args.vis_dir or os.path.join(out_dir, "vis_eval")
+        vis_loader = val_loader if args.vis_split == "val" else test_loader
         save_vis_samples(
             model=model,
-            loader=val_loader,
+            loader=vis_loader,
             device=device,
             out_dir=vis_dir,
             n=args.vis_n,
@@ -576,10 +605,15 @@ def main():
             thr=cfg.thr,
             topk=cfg.topk,
             smooth_k=cfg.smooth_k,
+            window=args.window,
+            stride=args.stride,
             use_ensemble=args.use_ensemble_pred,
             ensemble_cfg=ensemble_cfg,
+            vis_heads=args.vis_heads,
+            vis_head_mode=args.vis_head_mode,
+            vis_head_indices=args.vis_head_indices,
         )
-        print(f"Saved visualizations to {vis_dir}")
+        print(f"Saved visualizations ({args.vis_split}) to {vis_dir}")
 
 
 if __name__ == "__main__":

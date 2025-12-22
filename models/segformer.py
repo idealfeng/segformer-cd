@@ -11,8 +11,23 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import SegformerModel
+from transformers import SegformerConfig, SegformerModel
 from config import cfg
+
+
+def _torch_load_state_dict(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _strip_state_dict_prefix(state_dict, prefix: str):
+    if not isinstance(state_dict, dict):
+        return state_dict
+    if any(k.startswith(prefix) for k in state_dict.keys()):
+        return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in state_dict.items()}
+    return state_dict
 
 
 class ChannelAttention(nn.Module):
@@ -148,7 +163,8 @@ class SegFormerCD(nn.Module):
 
         # 检查本地权重
         local_weights_path = os.path.join("pretrained_weights", f"segformer_{variant}")
-        if os.path.exists(local_weights_path):
+        is_local = os.path.exists(local_weights_path)
+        if is_local:
             print(f"Loading local weights from '{local_weights_path}'...")
             model_name = local_weights_path
         else:
@@ -157,7 +173,36 @@ class SegFormerCD(nn.Module):
         print(f"Building SegFormer-{variant.upper()} for Change Detection...")
 
         # Siamese编码器（共享权重）
-        self.encoder = SegformerModel.from_pretrained(model_name)
+        if not pretrained:
+            config = SegformerConfig.from_pretrained(model_name, local_files_only=is_local)
+            self.encoder = SegformerModel(config)
+        else:
+            try:
+                self.encoder = SegformerModel.from_pretrained(model_name, local_files_only=is_local)
+            except ValueError as e:
+                # transformers may block loading `.bin` weights for older torch versions (CVE gate).
+                # If the weights are local and trusted, fall back to a manual load.
+                msg = str(e)
+                if not is_local or not (
+                    ("torch.load" in msg) or ("vulnerability" in msg) or ("CVE" in msg) or ("check_torch_load_is_safe" in msg)
+                ):
+                    raise
+
+                bin_path = os.path.join(model_name, "pytorch_model.bin")
+                if not os.path.exists(bin_path):
+                    raise
+
+                print(
+                    "Warning: transformers blocked loading local `.bin` weights (torch version/security gate). "
+                    "Falling back to `torch.load` for trusted local weights; recommended fix is upgrading torch "
+                    "or using safetensors."
+                )
+                config = SegformerConfig.from_pretrained(model_name, local_files_only=True)
+                self.encoder = SegformerModel(config)
+                state_dict = _torch_load_state_dict(bin_path)
+                state_dict = _strip_state_dict_prefix(state_dict, "segformer.")
+                state_dict = _strip_state_dict_prefix(state_dict, "model.")
+                self.encoder.load_state_dict(state_dict, strict=False)
 
         # 获取各stage通道数
         self.channels = self.encoder.config.hidden_sizes  # e.g., [64, 128, 320, 512] for B1

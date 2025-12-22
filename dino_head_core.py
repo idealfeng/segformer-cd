@@ -633,6 +633,9 @@ def save_vis_samples(
     stride: Optional[int] = None,
     use_ensemble: bool = False,
     ensemble_cfg: Optional[Dict] = None,
+    vis_heads: bool = False,
+    vis_head_mode: str = "logit",
+    vis_head_indices: Optional[List[int]] = None,
 ):
     import matplotlib.pyplot as plt
     ensure_dir(out_dir)
@@ -645,6 +648,7 @@ def save_vis_samples(
         img_b = batch["img_b"].to(device)
         gt = batch["label"]
         names = batch["name"]
+        logits_all = None
         if window is not None and stride is not None:
             prob = sliding_window_inference(
                 model=model,
@@ -656,12 +660,35 @@ def save_vis_samples(
                 use_ensemble=use_ensemble,
                 ensemble_cfg=ensemble_cfg,
             )
+            if vis_heads:
+                try:
+                    logits_all = sliding_window_inference_logits_all(
+                        model=model,
+                        img_a=img_a,
+                        img_b=img_b,
+                        window=window,
+                        stride=stride,
+                        device=device,
+                    )
+                except Exception:
+                    logits_all = None
         else:
             out = model(img_a, img_b)
             prob = _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
+            if vis_heads and isinstance(out, dict):
+                logits_all = out.get("logits_all")
         if smooth_k and smooth_k > 1:
             pad = smooth_k // 2
             prob = F.avg_pool2d(prob, kernel_size=smooth_k, stride=1, padding=pad)
+            if logits_all is not None:
+                pad = smooth_k // 2
+                # logits_all: [K,B,1,H,W]
+                logits_all = F.avg_pool2d(
+                    logits_all.view(-1, 1, logits_all.shape[-2], logits_all.shape[-1]),
+                    kernel_size=smooth_k,
+                    stride=1,
+                    padding=pad,
+                ).view(logits_all.shape[0], logits_all.shape[1], 1, logits_all.shape[-2], logits_all.shape[-1])
         B = img_a.shape[0]
         for bi in range(B):
             prob_np = prob[bi].squeeze().detach().cpu().numpy()
@@ -686,6 +713,70 @@ def save_vis_samples(
             save_path = os.path.join(out_dir, f"{saved:03d}_{name}.png")
             plt.savefig(save_path, dpi=150, bbox_inches="tight")
             plt.close()
+
+            if vis_heads:
+                if logits_all is None or not isinstance(logits_all, torch.Tensor) or logits_all.ndim != 5:
+                    # no logits_all available; likely use_layer_ensemble=False
+                    pass
+                else:
+                    # logits_all: [K,B,1,H,W]
+                    z = logits_all[:, bi, 0]  # [K,H,W]
+                    K = z.shape[0]
+                    idx = vis_head_indices
+                    if idx is None:
+                        idx = list(range(K))
+                    idx = [int(i) for i in idx if 0 <= int(i) < K]
+                    if len(idx) > 0:
+                        try:
+                            layers = getattr(model, "selected_layers", None)
+                            if isinstance(layers, (list, tuple)) and len(layers) >= (K - 1):
+                                head_names = [f"D{int(layers[i])}" for i in range(K - 1)] + ["fused"]
+                            else:
+                                head_names = [f"head{i}" for i in range(K - 1)] + ["fused"]
+                        except Exception:
+                            head_names = [f"head{i}" for i in range(K - 1)] + ["fused"]
+
+                        if str(vis_head_mode).lower() == "prob":
+                            maps = torch.sigmoid(z).detach().cpu().numpy()
+                            vmin, vmax = 0.0, 1.0
+                            cmap = "jet"
+                            title_prefix = "Prob"
+                        else:
+                            maps = z.detach().cpu().numpy()
+                            vmax = float(np.percentile(np.abs(maps), 99.0)) if maps.size > 0 else 1.0
+                            vmax = max(vmax, 1e-6)
+                            vmin = -vmax
+                            cmap = "coolwarm"
+                            title_prefix = "Logit"
+
+                        probs_all = torch.sigmoid(z).detach().cpu().numpy()
+                        var_map = probs_all.var(axis=0)
+                        fig2_cols = max(3, len(idx) + 2)
+                        fig2, axes2 = plt.subplots(1, fig2_cols, figsize=(4 * fig2_cols, 4))
+                        if fig2_cols == 1:
+                            axes2 = [axes2]
+                        axes2[0].imshow(b_np)
+                        axes2[0].set_title("T2")
+                        axes2[0].axis("off")
+                        axes2[1].imshow(var_map, cmap="magma")
+                        axes2[1].set_title("Var(prob)")
+                        axes2[1].axis("off")
+                        im_last = None
+                        for j, hi in enumerate(idx):
+                            ax = axes2[j + 2]
+                            im2 = ax.imshow(maps[hi], cmap=cmap, vmin=vmin, vmax=vmax)
+                            im_last = im2
+                            ax.set_title(f"{title_prefix} {head_names[hi]}")
+                            ax.axis("off")
+                        if im_last is not None and len(idx) > 0:
+                            fig2.colorbar(im_last, ax=[axes2[j + 2] for j in range(len(idx))], fraction=0.02, pad=0.02)
+                        for kfill in range(len(idx) + 2, fig2_cols):
+                            axes2[kfill].axis("off")
+                        plt.tight_layout()
+                        save_path2 = os.path.join(out_dir, f"{saved:03d}_{name}_heads.png")
+                        plt.savefig(save_path2, dpi=150, bbox_inches="tight")
+                        plt.close(fig2)
+
             saved += 1
             if saved >= n:
                 return
