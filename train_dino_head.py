@@ -14,6 +14,7 @@ import torch
 from dino_head_core import (
     HeadCfg,
     DinoSiameseHead,
+    DinoFrozenA0Head,
     build_dataloaders,
     seed_everything,
     ensure_dir,
@@ -62,6 +63,7 @@ def parse_args():
     parser.add_argument("--vis_n", type=int, default=base.vis_n)
     parser.add_argument("--log_every", type=int, default=base.log_every)
     parser.add_argument("--use_ensemble_pred", action="store_true", default=base.use_ensemble_pred, help="use ensemble mean for eval/vis")
+    parser.add_argument("--arch", type=str, choices=["dlv", "a0"], default=base.arch, help="Model variant: dlv (default) | a0 (frozen backbone + single 1x1 head)")
     parser.add_argument("--dino_name", type=str, default=base.dino_name)
     parser.add_argument("--fuse_mode", type=str, choices=["abs", "abs+sum", "cat4"], default=base.fuse_mode)
     parser.add_argument("--use_whiten", action="store_true", default=base.use_whiten)
@@ -74,6 +76,7 @@ def parse_args():
     parser.add_argument("--boundary_dim", type=int, default=base.boundary_dim, help="embed dim for boundary decoder")
     parser.add_argument("--use_layer_ensemble", action="store_true", default=base.use_layer_ensemble, help="enable layer-wise ensemble heads")
     parser.add_argument("--layer_head_ch", type=int, default=base.layer_head_ch, help="channel width for fused ensemble head")
+    parser.add_argument("--a0_layer", type=int, default=base.a0_layer, help="Backbone layer index for A0 baseline (default: 12)")
     parser.add_argument("--full_eval", dest="full_eval", action="store_true")
     parser.add_argument("--no_full_eval", dest="full_eval", action="store_false")
     parser.set_defaults(full_eval=base.full_eval)
@@ -127,6 +130,7 @@ def parse_args():
         use_minarea=args.use_minarea,
         min_area=args.min_area,
         use_ensemble_pred=args.use_ensemble_pred,
+        arch=args.arch,
         dino_name=args.dino_name,
         use_whiten=args.use_whiten,
         use_domain_adv=args.use_domain_adv,
@@ -138,6 +142,7 @@ def parse_args():
         boundary_dim=args.boundary_dim,
         use_layer_ensemble=args.use_layer_ensemble,
         layer_head_ch=args.layer_head_ch,
+        a0_layer=args.a0_layer,
         save_best=args.save_best,
         save_last=args.save_last,
         vis_every=args.vis_every,
@@ -159,19 +164,29 @@ def main():
     train_loader, val_loader, test_loader = build_dataloaders(cfg)
     with open(os.path.join(cfg.out_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, ensure_ascii=False, indent=2)
-    model = DinoSiameseHead(
-        dino_name=cfg.dino_name,
-        use_whiten=cfg.use_whiten,
-        use_domain_adv=cfg.use_domain_adv,
-        domain_hidden=cfg.domain_hidden,
-        domain_grl=cfg.domain_grl,
-        use_style_norm=cfg.use_style_norm,
-        proto_path=cfg.proto_path,
-        proto_weight=cfg.proto_weight,
-        boundary_dim=cfg.boundary_dim,
-        use_layer_ensemble=cfg.use_layer_ensemble,
-        layer_head_ch=cfg.layer_head_ch,
-    ).to(device)
+
+    if cfg.arch == "a0":
+        if cfg.use_layer_ensemble or cfg.boundary_dim or cfg.use_domain_adv or cfg.use_style_norm or cfg.proto_weight:
+            print("[A0] Note: ignoring DLF/MHE/auxiliary modules; using frozen backbone + single 1x1 head only.")
+        model = DinoFrozenA0Head(
+            dino_name=cfg.dino_name,
+            layer=cfg.a0_layer,
+            use_whiten=cfg.use_whiten,
+        ).to(device)
+    else:
+        model = DinoSiameseHead(
+            dino_name=cfg.dino_name,
+            use_whiten=cfg.use_whiten,
+            use_domain_adv=cfg.use_domain_adv,
+            domain_hidden=cfg.domain_hidden,
+            domain_grl=cfg.domain_grl,
+            use_style_norm=cfg.use_style_norm,
+            proto_path=cfg.proto_path,
+            proto_weight=cfg.proto_weight,
+            boundary_dim=cfg.boundary_dim,
+            use_layer_ensemble=cfg.use_layer_ensemble,
+            layer_head_ch=cfg.layer_head_ch,
+        ).to(device)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda") and torch.cuda.is_available())

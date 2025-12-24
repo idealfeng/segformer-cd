@@ -232,6 +232,7 @@ class HeadCfg:
     use_ensemble_pred: bool = False
 
     # model
+    arch: str = "dlv"  # dlv (default) | a0 (frozen backbone + single 1x1 head)
     dino_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     fuse_mode: str = "abs+sum"
     use_whiten: bool = False
@@ -244,6 +245,7 @@ class HeadCfg:
     boundary_dim: int = 0
     use_layer_ensemble: bool = False
     layer_head_ch: int = 128
+    a0_layer: int = 12  # only used when arch == "a0"
 
     # saving / logging
     save_best: bool = True
@@ -470,7 +472,7 @@ def sliding_window_inference_logits_all(
     logits_all = logit_sum / count_map.clamp_min(1e-6)  # [K,1,H,W]
     return logits_all.unsqueeze(1)  # [K,1,1,H,W]
 
-from models.dinov2_head import DinoSiameseHead
+from models.dinov2_head import DinoSiameseHead, DinoFrozenA0Head
 
 def train_one_epoch(
     model: nn.Module,
@@ -758,6 +760,7 @@ def build_dataloaders(cfg: HeadCfg) -> Tuple[DataLoader, DataLoader, DataLoader]
 __all__ = [
     "HeadCfg",
     "DinoSiameseHead",
+    "DinoFrozenA0Head",
     "build_dataloaders",
     "seed_everything",
     "ensure_dir",

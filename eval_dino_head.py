@@ -13,6 +13,7 @@ import torch
 from dino_head_core import (
     HeadCfg,
     DinoSiameseHead,
+    DinoFrozenA0Head,
     build_dataloaders,
     seed_everything,
     evaluate,
@@ -404,21 +405,32 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device)
     load_cfg = ckpt.get("cfg")
     if isinstance(load_cfg, dict):
+        cfg.arch = load_cfg.get("arch", getattr(cfg, "arch", "dlv"))
+        cfg.a0_layer = load_cfg.get("a0_layer", getattr(cfg, "a0_layer", 12))
         cfg.use_layer_ensemble = load_cfg.get("use_layer_ensemble", cfg.use_layer_ensemble)
         cfg.layer_head_ch = load_cfg.get("layer_head_ch", cfg.layer_head_ch)
-    model = DinoSiameseHead(
-        dino_name=load_cfg.get("dino_name", cfg.dino_name) if isinstance(load_cfg, dict) else cfg.dino_name,
-        use_whiten=load_cfg.get("use_whiten", cfg.use_whiten) if isinstance(load_cfg, dict) else cfg.use_whiten,
-        use_domain_adv=load_cfg.get("use_domain_adv", cfg.use_domain_adv) if isinstance(load_cfg, dict) else cfg.use_domain_adv,
-        domain_hidden=load_cfg.get("domain_hidden", cfg.domain_hidden) if isinstance(load_cfg, dict) else cfg.domain_hidden,
-        domain_grl=load_cfg.get("domain_grl", cfg.domain_grl) if isinstance(load_cfg, dict) else cfg.domain_grl,
-        use_style_norm=load_cfg.get("use_style_norm", cfg.use_style_norm) if isinstance(load_cfg, dict) else cfg.use_style_norm,
-        proto_path=load_cfg.get("proto_path", cfg.proto_path) if isinstance(load_cfg, dict) else cfg.proto_path,
-        proto_weight=load_cfg.get("proto_weight", cfg.proto_weight) if isinstance(load_cfg, dict) else cfg.proto_weight,
-        boundary_dim=load_cfg.get("boundary_dim", cfg.boundary_dim) if isinstance(load_cfg, dict) else cfg.boundary_dim,
-        use_layer_ensemble=load_cfg.get("use_layer_ensemble", cfg.use_layer_ensemble) if isinstance(load_cfg, dict) else cfg.use_layer_ensemble,
-        layer_head_ch=load_cfg.get("layer_head_ch", cfg.layer_head_ch) if isinstance(load_cfg, dict) else cfg.layer_head_ch,
-    ).to(device)
+
+    arch = load_cfg.get("arch", getattr(cfg, "arch", "dlv")) if isinstance(load_cfg, dict) else "dlv"
+    if arch == "a0":
+        model = DinoFrozenA0Head(
+            dino_name=load_cfg.get("dino_name", cfg.dino_name) if isinstance(load_cfg, dict) else cfg.dino_name,
+            layer=load_cfg.get("a0_layer", cfg.a0_layer) if isinstance(load_cfg, dict) else cfg.a0_layer,
+            use_whiten=load_cfg.get("use_whiten", cfg.use_whiten) if isinstance(load_cfg, dict) else cfg.use_whiten,
+        ).to(device)
+    else:
+        model = DinoSiameseHead(
+            dino_name=load_cfg.get("dino_name", cfg.dino_name) if isinstance(load_cfg, dict) else cfg.dino_name,
+            use_whiten=load_cfg.get("use_whiten", cfg.use_whiten) if isinstance(load_cfg, dict) else cfg.use_whiten,
+            use_domain_adv=load_cfg.get("use_domain_adv", cfg.use_domain_adv) if isinstance(load_cfg, dict) else cfg.use_domain_adv,
+            domain_hidden=load_cfg.get("domain_hidden", cfg.domain_hidden) if isinstance(load_cfg, dict) else cfg.domain_hidden,
+            domain_grl=load_cfg.get("domain_grl", cfg.domain_grl) if isinstance(load_cfg, dict) else cfg.domain_grl,
+            use_style_norm=load_cfg.get("use_style_norm", cfg.use_style_norm) if isinstance(load_cfg, dict) else cfg.use_style_norm,
+            proto_path=load_cfg.get("proto_path", cfg.proto_path) if isinstance(load_cfg, dict) else cfg.proto_path,
+            proto_weight=load_cfg.get("proto_weight", cfg.proto_weight) if isinstance(load_cfg, dict) else cfg.proto_weight,
+            boundary_dim=load_cfg.get("boundary_dim", cfg.boundary_dim) if isinstance(load_cfg, dict) else cfg.boundary_dim,
+            use_layer_ensemble=load_cfg.get("use_layer_ensemble", cfg.use_layer_ensemble) if isinstance(load_cfg, dict) else cfg.use_layer_ensemble,
+            layer_head_ch=load_cfg.get("layer_head_ch", cfg.layer_head_ch) if isinstance(load_cfg, dict) else cfg.layer_head_ch,
+        ).to(device)
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
     print(f"Loaded checkpoint from {args.checkpoint}")
     print(f"val/test sizes: {len(val_loader.dataset)}/{len(test_loader.dataset)}")
@@ -432,7 +444,10 @@ def main():
                 print(f"[Ensemble] Using fixed heads indices={args.ensemble_indices} with mode={args.ensemble_strategy}")
         else:
             if not getattr(cfg, "use_layer_ensemble", False):
-                print("Warning: use_layer_ensemble=False in checkpoint cfg; logits_all may be None, ensemble will fallback to pred.")
+                print("[Ensemble] use_layer_ensemble=False; cannot score heads for topk/weighted/cvx strategies. Disabling ensemble.")
+                args.use_ensemble_pred = False
+
+    if args.use_ensemble_pred and ensemble_cfg is None and args.ensemble_strategy not in ("mean_prob", "mean_logit"):
             print("\n[Ensemble] Scoring each head on VAL to derive selection/weights...")
             head_metrics = score_heads_on_loader(
                 model=model,

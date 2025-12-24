@@ -44,6 +44,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 from dino_head_core import (
     HeadCfg,
     DinoSiameseHead,
+    DinoFrozenA0Head,
     build_dataloaders,
     seed_everything,
     threshold_map,
@@ -528,19 +529,27 @@ def main():
         raise ValueError("split=train not supported for this visualization script.")
 
     if isinstance(load_cfg, dict):
-        model = DinoSiameseHead(
-            dino_name=load_cfg.get("dino_name", cfg.dino_name),
-            use_whiten=load_cfg.get("use_whiten", cfg.use_whiten),
-            use_domain_adv=load_cfg.get("use_domain_adv", cfg.use_domain_adv),
-            domain_hidden=load_cfg.get("domain_hidden", cfg.domain_hidden),
-            domain_grl=load_cfg.get("domain_grl", cfg.domain_grl),
-            use_style_norm=load_cfg.get("use_style_norm", cfg.use_style_norm),
-            proto_path=load_cfg.get("proto_path", cfg.proto_path),
-            proto_weight=load_cfg.get("proto_weight", cfg.proto_weight),
-            boundary_dim=load_cfg.get("boundary_dim", cfg.boundary_dim),
-            use_layer_ensemble=load_cfg.get("use_layer_ensemble", cfg.use_layer_ensemble),
-            layer_head_ch=load_cfg.get("layer_head_ch", cfg.layer_head_ch),
-        ).to(device)
+        arch = str(load_cfg.get("arch", "dlv"))
+        if arch == "a0":
+            model = DinoFrozenA0Head(
+                dino_name=load_cfg.get("dino_name", cfg.dino_name),
+                layer=int(load_cfg.get("a0_layer", getattr(cfg, "a0_layer", 12))),
+                use_whiten=bool(load_cfg.get("use_whiten", cfg.use_whiten)),
+            ).to(device)
+        else:
+            model = DinoSiameseHead(
+                dino_name=load_cfg.get("dino_name", cfg.dino_name),
+                use_whiten=load_cfg.get("use_whiten", cfg.use_whiten),
+                use_domain_adv=load_cfg.get("use_domain_adv", cfg.use_domain_adv),
+                domain_hidden=load_cfg.get("domain_hidden", cfg.domain_hidden),
+                domain_grl=load_cfg.get("domain_grl", cfg.domain_grl),
+                use_style_norm=load_cfg.get("use_style_norm", cfg.use_style_norm),
+                proto_path=load_cfg.get("proto_path", cfg.proto_path),
+                proto_weight=load_cfg.get("proto_weight", cfg.proto_weight),
+                boundary_dim=load_cfg.get("boundary_dim", cfg.boundary_dim),
+                use_layer_ensemble=load_cfg.get("use_layer_ensemble", cfg.use_layer_ensemble),
+                layer_head_ch=load_cfg.get("layer_head_ch", cfg.layer_head_ch),
+            ).to(device)
         model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
     else:
         model = DinoSiameseHead().to(device)
