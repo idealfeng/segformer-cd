@@ -50,6 +50,11 @@ pretrained_weights/
 *.tmp
 *.temp
 
+# ---模型文件---
+dinov3-vits16
+dinov3-vitl16
+dinov3-vith16plus
+
 # --- 那个一次性的脚本文件夹 ---
 # 如果你觉得这些脚本也是核心代码的一部分，可以把下面这行注释掉
 # 如果你觉得它们只是临时工具，就保留它

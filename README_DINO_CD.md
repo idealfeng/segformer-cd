@@ -7,7 +7,7 @@
 - **多层特征**：从 DINO 的多个 block 取特征（默认 4 层），浅层偏纹理/边缘，深层偏语义。
 - **差分模块**：对每层做 `DifferenceModule`（`|Fa-Fb|` 与 `Fa+Fb` 拼接 + 卷积 + 通道注意力）。
 - **主干解码器（MLP/轻解码器）**：多尺度 `1×1` 投影对齐后做融合与卷积细化，输出主 logit（`pred`）。
-- **Multi-Head Ensemble（可选）**：每一层差分特征各自一个 `LayerHead` 出 logit，同时再做一个 fused head；推理时可做 Top‑k / 加权集成 + 不确定性统计（方差等）。
+- **Multi-Head Ensemble（可选）**：为每层差分特征配置轻量 `LayerHead`，并保留融合解码器输出的 fused head 作为主分支；推理时在 **logit 空间**做集成（均值/加权），并可用多头分歧（如概率方差）刻画不确定性。
 
 相关实现位置：
 - 模型：`models/dinov2_head.py`（`DinoSiameseHead`）
@@ -49,6 +49,32 @@ python train_dino_head.py `
 ```
 
 注意：命令行里所有参数都必须带 `--`，比如 `--self_sup_weight 0.4`（你之前报错就是少了 `--`）。
+
+## 3.1 切换 DINOv3 Backbone：ViT-S / ViT-L
+
+这个项目里 DINO backbone 是由 `--dino_name` 控制的（训练/评估都会写入 cfg，也会存到 checkpoint 里）。`--dino_name` 可以传：
+
+- **HF 仓库名**（有网环境下会自动下载到 cache），比如 `facebook/dinov3-vitb16-pretrain-lvd1689m`
+- **本地目录**（离线更稳），比如你现在已经有的 `dinov3-vitb16/`（里面包含 `model.safetensors`/`config.json`/`preprocessor_config.json`）
+
+把 dinov3-b（vit-b/16）换成 vit-s/16 或 vit-l/16，最直接就是换 `--dino_name`：
+
+```bash
+# ViT-S/16（DINOv3）
+python train_dino_head.py --dino_name facebook/dinov3-vits16-pretrain-lvd1689m ...
+
+# ViT-L/16（DINOv3）
+python train_dino_head.py --dino_name facebook/dinov3-vitl16-pretrain-lvd1689m ...
+```
+
+如果你要离线跑，建议先把对应的模型仓库下载成一个和 `dinov3-vitb16/` 一样的本地目录（比如 `dinov3-vits16/`、`dinov3-vitl16/`），然后直接用：
+
+```bash
+python train_dino_head.py --dino_name dinov3-vits16 ...
+python train_dino_head.py --dino_name dinov3-vitl16 ...
+```
+
+补充：ViT-L 显存压力会大很多，通常需要把 `--batch_size` 降低（比如 1～2），否则容易 OOM。
 
 ## 4. 推荐评估命令（Top‑k / 加权集成）
 
@@ -142,10 +168,10 @@ python eval_dino_head.py `
 
 如果你要写论文，可以把 TGFC 作为“校准尝试/负向消融/讨论”，或在另一个实验分支中实现。
 
-## 6. 边界感知 / 因果推断（训练开关还是评估开关？）
+## 6. 边界感知 / 域稳健增强（训练开关还是评估开关？）
 
-- **边界感知（boundary）**：属于网络结构/分支（`--boundary_dim` + `--boundary_weight` 等），通常需要 **训练时打开**；评估时只要加载对应 checkpoint（脚本会读 ckpt 里的 cfg），不需要再额外开同名参数。
-- **因果推断 / 域对齐相关**（`--use_domain_adv`、`--use_style_norm`、`--lambda_domain`、`--lambda_consis`、`--self_sup_weight`、style aug 一组）：这些决定训练目标与训练时的数据扰动；同样主要是 **训练阶段** 的事。评估阶段只要 checkpoint 里启用了对应结构（比如 domain head / style norm），脚本会按 cfg 复现。
+- **边界感知（boundary）**：属于网络结构/分支（`--boundary_dim` + `--boundary_weight` 等）。分支输出边界 logit，并将边界特征/注意力注入主干以强化结构细节；通常需要 **训练时打开**。评估时只要加载对应 checkpoint（脚本会读 ckpt 里的 cfg），不需要再额外开同名参数。
+- **域稳健增强（domain-robust）**（`--use_domain_adv`、`--use_style_norm`、`--lambda_domain`、`--lambda_consis`、`--self_sup_weight`、style aug 一组）：用“风格扰动视图 + 一致性/辅助监督 + 域混淆对抗（GRL + discriminator）/风格归一化”等方式，缓解跨域纹理/成像风格差异带来的不稳定误检；这些主要作用于 **训练阶段**。评估阶段只要 checkpoint 里启用了对应结构（比如 domain head / style norm），脚本会按 cfg 复现。
 
 如果你要做“只改 eval，不改训练”的稳定器，那就优先用：
 - `ensemble_strategy topk/weighted_logit`

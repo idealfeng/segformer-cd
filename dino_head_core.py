@@ -141,7 +141,19 @@ def filter_small_cc(mask: np.ndarray, min_area: int = 256) -> np.ndarray:
         import cv2
     except Exception:
         return mask
-    mask_u8 = mask.astype(np.uint8) * 255
+    mask = np.asarray(mask)
+    # cv2.connectedComponentsWithStats expects a 2D single-channel 8-bit image.
+    # Be defensive: squeeze trivial singleton dims; otherwise skip filtering.
+    if mask.ndim == 3:
+        if mask.shape[0] == 1:
+            mask = mask[0]
+        elif mask.shape[-1] == 1:
+            mask = mask[..., 0]
+        else:
+            return mask
+    if mask.ndim != 2:
+        return mask
+    mask_u8 = ((mask > 0).astype(np.uint8) * 255).copy()
     num, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
     out = np.zeros_like(mask, dtype=np.uint8)
     for i in range(1, num):
@@ -589,6 +601,10 @@ def evaluate(
         img_a = batch["img_a"].to(device, non_blocking=True)
         img_b = batch["img_b"].to(device, non_blocking=True)
         gt = batch["label"]
+        if gt.ndim == 3:
+            gt = gt.unsqueeze(1)
+        elif gt.ndim == 4 and gt.shape[1] != 1:
+            gt = gt[:, :1]
         if window is not None and stride is not None:
             prob = sliding_window_inference(
                 model=model,
@@ -606,14 +622,17 @@ def evaluate(
         if smooth_k and smooth_k > 1:
             pad = smooth_k // 2
             prob = F.avg_pool2d(prob, kernel_size=smooth_k, stride=1, padding=pad)
-        prob_np = prob.squeeze(0).squeeze(0).float().cpu().numpy()
-        gt_np = gt.squeeze(0).cpu().numpy().astype(np.uint8) if gt.ndim == 3 else gt.cpu().numpy().astype(np.uint8)
-        pred_np, _ = threshold_map(prob_np, thr_mode, thr, topk)
-        if use_minarea:
-            pred_np = filter_small_cc(pred_np, min_area=min_area)
-        pred_t = torch.from_numpy(pred_np.astype(np.uint8))
-        gt_t = torch.from_numpy((gt_np > 0).astype(np.uint8))
-        confusion_update(pred_t, gt_t, cm)
+        # batch-safe evaluation
+        B = int(prob.shape[0])
+        for bi in range(B):
+            prob_np = prob[bi, 0].float().detach().cpu().numpy()
+            gt_np = gt[bi, 0].detach().cpu().numpy().astype(np.uint8)
+            pred_np, _ = threshold_map(prob_np, thr_mode, thr, topk)
+            if use_minarea:
+                pred_np = filter_small_cc(pred_np, min_area=min_area)
+            pred_t = torch.from_numpy(pred_np.astype(np.uint8))
+            gt_t = torch.from_numpy((gt_np > 0).astype(np.uint8))
+            confusion_update(pred_t, gt_t, cm)
         if print_every and (i % print_every == 0):
             print(f"[{i}/{len(loader)}] TP={cm['TP']} FP={cm['FP']} FN={cm['FN']} TN={cm['TN']}")
     return compute_metrics_from_cm(cm)
