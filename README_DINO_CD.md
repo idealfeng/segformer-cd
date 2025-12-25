@@ -76,6 +76,17 @@ python train_dino_head.py --dino_name dinov3-vitl16 ...
 
 补充：ViT-L 显存压力会大很多，通常需要把 `--batch_size` 降低（比如 1～2），否则容易 OOM。
 
+另外，`DinoSiameseHead` 默认只取 4 个中间层特征（`selected_layers=(3,6,9,12)`，**1-based**），这对 12-layer 的 ViT-S/B 合适；但对 24/32-layer 的 ViT-L/H 如果不改层号，会更偏“浅层对比”，做容量消融就不太公平。现在脚本支持：
+
+```bash
+# 12 layers（vits16 / vitb16）
+--selected_layers 3 6 9 12
+# 24 layers（vitl16）
+--selected_layers 6 12 18 24
+# 32 layers（vith16plus）
+--selected_layers 8 16 24 32
+```
+
 ## 4. 推荐评估命令（Top‑k / 加权集成）
 
 ### 4.1 只用 fused（不开集成）

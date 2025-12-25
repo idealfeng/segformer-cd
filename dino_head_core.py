@@ -234,6 +234,11 @@ class HeadCfg:
     # model
     arch: str = "dlv"  # dlv (default) | a0 (frozen backbone + single 1x1 head)
     dino_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+    # 1-based transformer block indices to use for multi-layer features.
+    # For 12-layer ViT (e.g., vits16/vitb16): (3, 6, 9, 12)
+    # For 24-layer ViT (e.g., vitl16): (6, 12, 18, 24)
+    # For 32-layer ViT (e.g., vith16plus): (8, 16, 24, 32)
+    selected_layers: Tuple[int, ...] = (3, 6, 9, 12)
     fuse_mode: str = "abs+sum"
     use_whiten: bool = False
     use_domain_adv: bool = False
@@ -246,6 +251,9 @@ class HeadCfg:
     use_layer_ensemble: bool = False
     layer_head_ch: int = 128
     a0_layer: int = 12  # only used when arch == "a0"
+    ft_mode: str = "frozen"  # frozen | shallow | deep | full (backbone fine-tuning)
+    ft_k: int = 4  # number of blocks to unfreeze for shallow/deep
+    backbone_lr: float = 1e-5  # lr for unfrozen backbone blocks
 
     # saving / logging
     save_best: bool = True
@@ -472,7 +480,11 @@ def sliding_window_inference_logits_all(
     logits_all = logit_sum / count_map.clamp_min(1e-6)  # [K,1,H,W]
     return logits_all.unsqueeze(1)  # [K,1,1,H,W]
 
-from models.dinov2_head import DinoSiameseHead, DinoFrozenA0Head
+try:
+    from models.dinov2_head import DinoSiameseHead, DinoFrozenA0Head
+except ImportError:
+    from models.dinov2_head import DinoSiameseHead
+    DinoFrozenA0Head = None
 
 def train_one_epoch(
     model: nn.Module,

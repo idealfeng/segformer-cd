@@ -61,6 +61,13 @@ def parse_args():
     parser.add_argument("--min_area", type=int, default=base.min_area)
     parser.add_argument("--use_ensemble_pred", action="store_true", default=base.use_ensemble_pred, help="use ensemble mean for evaluation")
     parser.add_argument(
+        "--selected_layers",
+        type=int,
+        nargs="+",
+        default=list(base.selected_layers),
+        help="1-based transformer block indices used by the head (must match checkpoint).",
+    )
+    parser.add_argument(
         "--ensemble_strategy",
         type=str,
         default="mean_prob",
@@ -146,6 +153,7 @@ def parse_args():
         use_minarea=args.use_minarea,
         min_area=args.min_area,
         use_ensemble_pred=args.use_ensemble_pred,
+        selected_layers=tuple(int(x) for x in args.selected_layers),
     )
     if args.window is not None and args.window <= 0:
         args.window = None
@@ -409,9 +417,16 @@ def main():
         cfg.a0_layer = load_cfg.get("a0_layer", getattr(cfg, "a0_layer", 12))
         cfg.use_layer_ensemble = load_cfg.get("use_layer_ensemble", cfg.use_layer_ensemble)
         cfg.layer_head_ch = load_cfg.get("layer_head_ch", cfg.layer_head_ch)
+        if load_cfg.get("selected_layers") is not None:
+            cfg.selected_layers = tuple(int(x) for x in load_cfg["selected_layers"])
 
     arch = load_cfg.get("arch", getattr(cfg, "arch", "dlv")) if isinstance(load_cfg, dict) else "dlv"
     if arch == "a0":
+        if DinoFrozenA0Head is None:
+            raise ImportError(
+                "DinoFrozenA0Head is not available. Please update models/dinov2_head.py to a version that defines DinoFrozenA0Head, "
+                "or evaluate a non-A0 checkpoint."
+            )
         model = DinoFrozenA0Head(
             dino_name=load_cfg.get("dino_name", cfg.dino_name) if isinstance(load_cfg, dict) else cfg.dino_name,
             layer=load_cfg.get("a0_layer", cfg.a0_layer) if isinstance(load_cfg, dict) else cfg.a0_layer,
@@ -420,6 +435,7 @@ def main():
     else:
         model = DinoSiameseHead(
             dino_name=load_cfg.get("dino_name", cfg.dino_name) if isinstance(load_cfg, dict) else cfg.dino_name,
+            selected_layers=cfg.selected_layers,
             use_whiten=load_cfg.get("use_whiten", cfg.use_whiten) if isinstance(load_cfg, dict) else cfg.use_whiten,
             use_domain_adv=load_cfg.get("use_domain_adv", cfg.use_domain_adv) if isinstance(load_cfg, dict) else cfg.use_domain_adv,
             domain_hidden=load_cfg.get("domain_hidden", cfg.domain_hidden) if isinstance(load_cfg, dict) else cfg.domain_hidden,
@@ -434,6 +450,27 @@ def main():
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
     print(f"Loaded checkpoint from {args.checkpoint}")
     print(f"val/test sizes: {len(val_loader.dataset)}/{len(test_loader.dataset)}")
+
+    # Convenience: allow passing transformer layer numbers in --ensemble_indices.
+    # If any provided index is >= K (K = len(selected_layers)+1), treat them as layer numbers.
+    if args.ensemble_indices is not None and isinstance(cfg.selected_layers, (list, tuple)) and len(cfg.selected_layers) > 0:
+        K = len(cfg.selected_layers) + 1
+        if any(int(i) >= K for i in args.ensemble_indices):
+            layer_to_head = {int(layer): idx for idx, layer in enumerate(cfg.selected_layers)}
+            mapped = []
+            for v in args.ensemble_indices:
+                vv = int(v)
+                if vv not in layer_to_head:
+                    raise ValueError(
+                        f"--ensemble_indices contains {vv}, which is not in selected_layers={list(cfg.selected_layers)}. "
+                        f"Provide head indices 0..{K-1}, or use layer numbers from selected_layers."
+                    )
+                mapped.append(layer_to_head[vv])
+            print(
+                f"[Ensemble] Mapped transformer layers {args.ensemble_indices} -> head indices {mapped} "
+                f"(selected_layers={list(cfg.selected_layers)})"
+            )
+            args.ensemble_indices = mapped
 
     ensemble_cfg = None
     if args.use_ensemble_pred:

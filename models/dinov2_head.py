@@ -436,6 +436,7 @@ class DinoSiameseHead(nn.Module):
         dino_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
         patch: int = 14,
         use_whiten: bool = False,
+        backbone_grad: bool = False,
         embed_dim: int = 256,
         head_channels: int = 256,
         head_depth: int = 3,
@@ -459,6 +460,7 @@ class DinoSiameseHead(nn.Module):
         super().__init__()
         self.patch = int(patch)
         self.use_whiten = bool(use_whiten)
+        self.backbone_grad = bool(backbone_grad)
         self.selected_layers = list(selected_layers)
         self.adapter_dim = int(adapter_dim)
         self.norm = norm
@@ -626,7 +628,6 @@ class DinoSiameseHead(nn.Module):
                 self.backbone.blocks[idx - 1].register_forward_hook(_make_hook())
             )
 
-    @torch.no_grad()
     def _extract_pair_features(
         self, img_a: torch.Tensor, img_b: torch.Tensor
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], Tuple[int, int], Tuple[int, int]]:
@@ -634,63 +635,65 @@ class DinoSiameseHead(nn.Module):
         Extract features for img_a/img_b in one forward (batch concat) to save time.
         Return two lists of [B,C,h,w], padded size, and original size.
         """
-        x = torch.cat([img_a, img_b], dim=0)
-        x, (H0, W0) = self._pad_to_patch_multiple(x)
-        B2, _, Hp, Wp = x.shape
-        assert B2 % 2 == 0, "Batch should be even when concatenating A/B"
-        B = B2 // 2
-        h, w = Hp // self.patch, Wp // self.patch
+        grad_ctx = (
+            torch.enable_grad()
+            if (self.backbone_grad and torch.is_grad_enabled())
+            else torch.no_grad()
+        )
+        with grad_ctx:
+            x = torch.cat([img_a, img_b], dim=0)
+            x, (H0, W0) = self._pad_to_patch_multiple(x)
+            B2, _, Hp, Wp = x.shape
+            assert B2 % 2 == 0, "Batch should be even when concatenating A/B"
+            B = B2 // 2
+            h, w = Hp // self.patch, Wp // self.patch
 
-        feats_raw: List[torch.Tensor] = []
+            feats_raw: List[torch.Tensor] = []
 
-        if self.use_hf:
-            out = self.backbone(
-                pixel_values=x, output_hidden_states=True, return_dict=True
-            )
-            hidden_states = out.hidden_states
-            if hidden_states is None:
-                hidden_states = [out.last_hidden_state]
-            for idx in self.selected_layers:
-                real_idx = min(idx, len(hidden_states) - 1)
-                feats_raw.append(hidden_states[real_idx])
-        else:
-            self._hook_feats = []
-            self._register_hooks_once()
-            _ = self.backbone.forward_features(x)
-            feats_raw = self._hook_feats
-            if len(feats_raw) != len(self.selected_layers):
-                raise RuntimeError(
-                    f"Expected {len(self.selected_layers)} hooks, got {len(feats_raw)}"
+            if self.use_hf:
+                out = self.backbone(
+                    pixel_values=x, output_hidden_states=True, return_dict=True
                 )
+                hidden_states = out.hidden_states
+                if hidden_states is None:
+                    hidden_states = [out.last_hidden_state]
+                for idx in self.selected_layers:
+                    real_idx = min(idx, len(hidden_states) - 1)
+                    feats_raw.append(hidden_states[real_idx])
+            else:
+                self._hook_feats = []
+                self._register_hooks_once()
+                _ = self.backbone.forward_features(x)
+                feats_raw = self._hook_feats
+                if len(feats_raw) != len(self.selected_layers):
+                    raise RuntimeError(
+                        f"Expected {len(self.selected_layers)} hooks, got {len(feats_raw)}"
+                    )
 
-        feats_a: List[torch.Tensor] = []
-        feats_b: List[torch.Tensor] = []
-        for feat in feats_raw:
-            if feat.ndim != 3:
-                raise ValueError(f"Unexpected hooked feat shape: {feat.shape}")
-            tokens = feat[:, 1 + self.num_reg :, :]  # [2B, Npatch, C]
-            if tokens.shape[1] != h * w:
-                tokens = tokens[:, -h * w :, :]
-            feat_map = tokens.transpose(1, 2).reshape(B2, tokens.shape[-1], h, w)
-            feat_map = F.normalize(feat_map, dim=1)
+            feats_a: List[torch.Tensor] = []
+            feats_b: List[torch.Tensor] = []
+            for feat in feats_raw:
+                if feat.ndim != 3:
+                    raise ValueError(f"Unexpected hooked feat shape: {feat.shape}")
+                tokens = feat[:, 1 + self.num_reg :, :]  # [2B, Npatch, C]
+                if tokens.shape[1] != h * w:
+                    tokens = tokens[:, -h * w :, :]
+                feat_map = tokens.transpose(1, 2).reshape(B2, tokens.shape[-1], h, w)
+                feat_map = F.normalize(feat_map, dim=1)
 
-            if self.use_whiten:
-                mu = feat_map.mean(dim=(2, 3), keepdim=True)
-                sd = feat_map.std(dim=(2, 3), keepdim=True).clamp_min(1e-6)
-                feat_map = (feat_map - mu) / sd
+                if self.use_whiten:
+                    mu = feat_map.mean(dim=(2, 3), keepdim=True)
+                    sd = feat_map.std(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+                    feat_map = (feat_map - mu) / sd
 
-            feats_a.append(feat_map[:B])
-            feats_b.append(feat_map[B:])
+                feats_a.append(feat_map[:B])
+                feats_b.append(feat_map[B:])
 
-        return feats_a, feats_b, (Hp, Wp), (H0, W0)
+            return feats_a, feats_b, (Hp, Wp), (H0, W0)
 
     def forward(self, img_a: torch.Tensor, img_b: torch.Tensor):
         B, _, H, W = img_a.shape
-
-        with torch.no_grad():
-            fa_list, fb_list, (Hp, Wp), (H0, W0) = self._extract_pair_features(
-                img_a, img_b
-            )
+        fa_list, fb_list, (Hp, Wp), (H0, W0) = self._extract_pair_features(img_a, img_b)
 
         diff_feats = []
         logits_list = []

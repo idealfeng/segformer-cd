@@ -4,6 +4,7 @@ python train_dino_head.py --data_root data/WHUCD --out_dir outputs/dino_head_cd 
 """
 
 import argparse
+import inspect
 import json
 import os
 import time
@@ -23,6 +24,66 @@ from dino_head_core import (
     save_vis_samples,
     build_scheduler,  # ← 这一行补上
 )
+
+def _get_backbone_blocks(backbone):
+    """
+    Best-effort access to the ViT block list for (HF) DINOv3 or (hub) DINOv2.
+    Returns a list of blocks, or None if unknown.
+    """
+    candidates = ["encoder.layers", "encoder.layer", "layers", "blocks"]
+    for path in candidates:
+        obj = backbone
+        ok = True
+        for part in path.split("."):
+            if not hasattr(obj, part):
+                ok = False
+                break
+            obj = getattr(obj, part)
+        if ok and isinstance(obj, (list, tuple, torch.nn.ModuleList)):
+            return list(obj)
+    return None
+
+
+def _configure_backbone_finetune(model: torch.nn.Module, ft_mode: str, ft_k: int) -> int:
+    """
+    Configure which backbone blocks are trainable.
+    Returns number of trainable backbone parameters.
+    """
+    if not hasattr(model, "backbone"):
+        return 0
+    ft_mode = str(ft_mode).lower()
+    ft_k = int(ft_k)
+
+    for p in model.backbone.parameters():
+        p.requires_grad = False
+
+    if ft_mode == "frozen":
+        return 0
+    if ft_mode == "full":
+        for p in model.backbone.parameters():
+            p.requires_grad = True
+        return sum(int(p.requires_grad) for p in model.backbone.parameters())
+
+    blocks = _get_backbone_blocks(model.backbone)
+    if not blocks:
+        print("[FT] Warning: unable to locate backbone blocks; falling back to full fine-tune.")
+        for p in model.backbone.parameters():
+            p.requires_grad = True
+        return sum(int(p.requires_grad) for p in model.backbone.parameters())
+
+    n = len(blocks)
+    k = max(0, min(ft_k, n))
+    if ft_mode == "shallow":
+        idxs = range(0, k)
+    elif ft_mode == "deep":
+        idxs = range(n - k, n)
+    else:
+        raise ValueError(f"Unknown ft_mode: {ft_mode} (expected frozen|shallow|deep|full)")
+
+    for i in idxs:
+        for p in blocks[i].parameters():
+            p.requires_grad = True
+    return sum(int(p.requires_grad) for p in model.backbone.parameters())
 
 
 def parse_args():
@@ -65,6 +126,13 @@ def parse_args():
     parser.add_argument("--use_ensemble_pred", action="store_true", default=base.use_ensemble_pred, help="use ensemble mean for eval/vis")
     parser.add_argument("--arch", type=str, choices=["dlv", "a0"], default=base.arch, help="Model variant: dlv (default) | a0 (frozen backbone + single 1x1 head)")
     parser.add_argument("--dino_name", type=str, default=base.dino_name)
+    parser.add_argument(
+        "--selected_layers",
+        type=int,
+        nargs="+",
+        default=list(base.selected_layers),
+        help="1-based transformer block indices to use (e.g., 3 6 9 12 for 12-layer; 6 12 18 24 for 24-layer; 8 16 24 32 for 32-layer)",
+    )
     parser.add_argument("--fuse_mode", type=str, choices=["abs", "abs+sum", "cat4"], default=base.fuse_mode)
     parser.add_argument("--use_whiten", action="store_true", default=base.use_whiten)
     parser.add_argument("--use_domain_adv", action="store_true", default=base.use_domain_adv)
@@ -77,6 +145,9 @@ def parse_args():
     parser.add_argument("--use_layer_ensemble", action="store_true", default=base.use_layer_ensemble, help="enable layer-wise ensemble heads")
     parser.add_argument("--layer_head_ch", type=int, default=base.layer_head_ch, help="channel width for fused ensemble head")
     parser.add_argument("--a0_layer", type=int, default=base.a0_layer, help="Backbone layer index for A0 baseline (default: 12)")
+    parser.add_argument("--ft_mode", type=str, choices=["frozen", "shallow", "deep", "full"], default=base.ft_mode, help="Backbone fine-tune mode (dlv only)")
+    parser.add_argument("--ft_k", type=int, default=base.ft_k, help="Number of ViT blocks to unfreeze for shallow/deep")
+    parser.add_argument("--backbone_lr", type=float, default=base.backbone_lr, help="Learning rate for unfrozen backbone parameters")
     parser.add_argument("--full_eval", dest="full_eval", action="store_true")
     parser.add_argument("--no_full_eval", dest="full_eval", action="store_false")
     parser.set_defaults(full_eval=base.full_eval)
@@ -132,6 +203,7 @@ def parse_args():
         use_ensemble_pred=args.use_ensemble_pred,
         arch=args.arch,
         dino_name=args.dino_name,
+        selected_layers=tuple(int(x) for x in args.selected_layers),
         use_whiten=args.use_whiten,
         use_domain_adv=args.use_domain_adv,
         domain_hidden=args.domain_hidden,
@@ -143,6 +215,9 @@ def parse_args():
         use_layer_ensemble=args.use_layer_ensemble,
         layer_head_ch=args.layer_head_ch,
         a0_layer=args.a0_layer,
+        ft_mode=args.ft_mode,
+        ft_k=args.ft_k,
+        backbone_lr=args.backbone_lr,
         save_best=args.save_best,
         save_last=args.save_last,
         vis_every=args.vis_every,
@@ -166,6 +241,11 @@ def main():
         json.dump(asdict(cfg), f, ensure_ascii=False, indent=2)
 
     if cfg.arch == "a0":
+        if DinoFrozenA0Head is None:
+            raise ImportError(
+                "DinoFrozenA0Head is not available. Please update models/dinov2_head.py to a version that defines DinoFrozenA0Head, "
+                "or use --arch dlv."
+            )
         if cfg.use_layer_ensemble or cfg.boundary_dim or cfg.use_domain_adv or cfg.use_style_norm or cfg.proto_weight:
             print("[A0] Note: ignoring DLF/MHE/auxiliary modules; using frozen backbone + single 1x1 head only.")
         model = DinoFrozenA0Head(
@@ -174,9 +254,11 @@ def main():
             use_whiten=cfg.use_whiten,
         ).to(device)
     else:
-        model = DinoSiameseHead(
+        head_kwargs = dict(
             dino_name=cfg.dino_name,
+            selected_layers=cfg.selected_layers,
             use_whiten=cfg.use_whiten,
+            backbone_grad=(cfg.ft_mode != "frozen"),
             use_domain_adv=cfg.use_domain_adv,
             domain_hidden=cfg.domain_hidden,
             domain_grl=cfg.domain_grl,
@@ -186,9 +268,35 @@ def main():
             boundary_dim=cfg.boundary_dim,
             use_layer_ensemble=cfg.use_layer_ensemble,
             layer_head_ch=cfg.layer_head_ch,
-        ).to(device)
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
+        )
+        sig = inspect.signature(DinoSiameseHead.__init__)
+        head_kwargs = {k: v for k, v in head_kwargs.items() if k in sig.parameters}
+        if (cfg.ft_mode != "frozen") and ("backbone_grad" not in sig.parameters):
+            print("[FT] Warning: this DinoSiameseHead version has no backbone_grad; backbone fine-tuning may not work as expected.")
+        model = DinoSiameseHead(**head_kwargs).to(device)
+
+        n_trainable_bb = _configure_backbone_finetune(model, cfg.ft_mode, cfg.ft_k)
+        if cfg.ft_mode != "frozen":
+            print(
+                f"[FT] mode={cfg.ft_mode} ft_k={cfg.ft_k} backbone_lr={cfg.backbone_lr} "
+                f"trainable_backbone_params={n_trainable_bb}"
+            )
+
+    head_params = []
+    backbone_params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith("backbone."):
+            backbone_params.append(p)
+        else:
+            head_params.append(p)
+    param_groups = []
+    if head_params:
+        param_groups.append({"params": head_params, "lr": cfg.lr})
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": cfg.backbone_lr})
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=device.startswith("cuda") and torch.cuda.is_available())
     scheduler = build_scheduler(optimizer, cfg)
     best_f1 = -1.0
@@ -197,7 +305,10 @@ def main():
         ckpt = torch.load(resume_ckpt, map_location=device)
         model.load_state_dict(ckpt["model"])
         if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception as e:
+                print(f"[Resume] Warning: failed to load optimizer state (param groups may differ): {e}")
         if scheduler is not None and ckpt.get("scheduler") is not None:
             try:
                 scheduler.load_state_dict(ckpt["scheduler"])
