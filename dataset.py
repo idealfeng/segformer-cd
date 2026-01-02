@@ -52,6 +52,40 @@ def _read_mask_any(path: Path) -> np.ndarray:
 class LEVIRCDDataset(Dataset):
     """LEVIR-CD变化检测数据集"""
 
+    @staticmethod
+    def _find_split_dir(root_dir: Path, split: str, max_depth: int = 3) -> Optional[Path]:
+        """
+        Find a directory that contains the given split folder.
+        Handles wrappers like root/JL1-CD/JL1-CD/.../{train,test,...}.
+        Returns the split directory path (i.e., .../<split>) or None.
+        """
+        root_dir = Path(root_dir)
+        split = str(split)
+        if (root_dir / split).is_dir():
+            return root_dir / split
+
+        queue: List[Tuple[Path, int]] = [(root_dir, 0)]
+        hits: List[Tuple[int, Path]] = []
+        while queue:
+            cur, depth = queue.pop(0)
+            candidate = cur / split
+            if candidate.is_dir():
+                hits.append((depth, candidate))
+                continue
+            if depth >= max_depth:
+                continue
+            try:
+                children = [p for p in cur.iterdir() if p.is_dir() and not p.name.startswith(".")]
+            except Exception:
+                children = []
+            for ch in children:
+                queue.append((ch, depth + 1))
+
+        if not hits:
+            return None
+        hits.sort(key=lambda x: x[0])
+        return hits[0][1]
+
     def __init__(
         self,
         root_dir: Path,
@@ -73,9 +107,40 @@ class LEVIRCDDataset(Dataset):
 
         # 设置路径
         split_dir = self.root_dir / split
-        self.img_a_dir = split_dir / 'A'
-        self.img_b_dir = split_dir / 'B'
-        self.label_dir = split_dir / 'label'
+        if not split_dir.is_dir():
+            found = self._find_split_dir(self.root_dir, split)
+            if found is not None:
+                split_dir = found
+        # Some datasets are packaged as root/split/split/{A,B,label} (e.g., SYSU-CD/train/train/A).
+        if not (split_dir / "A").exists():
+            nested = split_dir / split
+            if (nested / "A").exists():
+                split_dir = nested
+
+        def _pick_dir(base: Path, candidates: List[str]) -> Optional[Path]:
+            for name in candidates:
+                p = base / name
+                if p.is_dir():
+                    return p
+            return None
+
+        # Different CD datasets use different folder names.
+        # Prefer canonical A/B/label, but support common aliases (e.g., S2Looking uses Image1/Image2).
+        img_a_dir = _pick_dir(split_dir, ["A", "Image1", "T1", "t1", "img1", "im1"])
+        img_b_dir = _pick_dir(split_dir, ["B", "Image2", "T2", "t2", "img2", "im2"])
+        label_dir = _pick_dir(split_dir, ["label", "Label", "GT", "gt", "mask", "masks", "labels", "label1", "label2"])
+
+        # Extra fallback: root/split/split/{Image1,Image2,...}
+        if img_a_dir is None or img_b_dir is None:
+            nested = split_dir / split
+            if nested.is_dir():
+                img_a_dir = img_a_dir or _pick_dir(nested, ["A", "Image1", "T1", "t1", "img1", "im1"])
+                img_b_dir = img_b_dir or _pick_dir(nested, ["B", "Image2", "T2", "t2", "img2", "im2"])
+                label_dir = label_dir or _pick_dir(nested, ["label", "Label", "GT", "gt", "mask", "masks", "labels", "label1", "label2"])
+
+        self.img_a_dir = img_a_dir or (split_dir / "A")
+        self.img_b_dir = img_b_dir or (split_dir / "B")
+        self.label_dir = label_dir or (split_dir / "label")
 
         # 获取所有图像文件名
         self.img_names = self._get_image_names()
@@ -85,13 +150,36 @@ class LEVIRCDDataset(Dataset):
 
     def _get_image_names(self) -> List[str]:
         if not self.img_a_dir.exists():
-            raise FileNotFoundError(f"Directory not found: {self.img_a_dir}")
+            raise FileNotFoundError(
+                f"Directory not found: {self.img_a_dir} (expected {self.root_dir}/{self.split}/A or {self.root_dir}/{self.split}/Image1, "
+                f"or nested {self.root_dir}/{self.split}/{self.split}/...)"
+            )
 
-        stems = []
+        stems_a = []
         for ext in EXTS:
-            stems += [f.stem for f in self.img_a_dir.glob(f"*{ext}")]
-        stems = sorted(list(set(stems)))
-        return stems
+            stems_a += [f.stem for f in self.img_a_dir.glob(f"*{ext}")]
+        stems_a = sorted(list(set(stems_a)))
+
+        def _exists_any(folder: Path, stem: str) -> bool:
+            for ext in EXTS:
+                if (folder / f"{stem}{ext}").exists():
+                    return True
+            return False
+
+        kept = []
+        dropped = 0
+        for stem in stems_a:
+            if not _exists_any(self.img_b_dir, stem):
+                dropped += 1
+                continue
+            if not _exists_any(self.label_dir, stem):
+                dropped += 1
+                continue
+            kept.append(stem)
+
+        if dropped > 0:
+            print(f"[{self.split.upper()}] Warning: dropped {dropped} samples missing B/label match.")
+        return kept
 
     def __len__(self) -> int:
         return len(self.img_names)

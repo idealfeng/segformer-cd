@@ -18,6 +18,7 @@ from dino_head_core import (
     seed_everything,
     evaluate,
     save_vis_samples,
+    sliding_window_inference,
     sliding_window_inference_logits_all,
     sliding_window_inference_probs_all,
     threshold_map,
@@ -52,9 +53,15 @@ def parse_args():
     parser.add_argument("--no_full_eval", dest="full_eval", action="store_false")
     parser.set_defaults(full_eval=base.full_eval)
     parser.add_argument("--eval_crop", type=int, default=base.eval_crop)
-    parser.add_argument("--thr_mode", type=str, choices=["fixed", "topk", "otsu"], default=base.thr_mode)
+    parser.add_argument("--thr_mode", type=str, choices=["fixed", "topk", "otsu", "val_best"], default=base.thr_mode)
     parser.add_argument("--thr", type=float, default=base.thr)
     parser.add_argument("--topk", type=float, default=base.topk)
+    parser.add_argument(
+        "--val_best_max_pixels",
+        type=int,
+        default=400000,
+        help="For thr_mode=val_best: max sampled pixels from VAL to search best fixed threshold.",
+    )
     parser.add_argument("--beta_prior", type=float, default=beta_default, help="Expected change ratio prior for beta mixture")
     parser.add_argument("--smooth_k", type=int, default=base.smooth_k)
     parser.add_argument("--use_minarea", action="store_true", default=base.use_minarea)
@@ -127,6 +134,27 @@ def parse_args():
         help="滑窗步长，默认等于 window",
     )
     args = parser.parse_args()
+
+    def _has_ab_label(p: Path) -> bool:
+        return (p / "A").is_dir() and (p / "B").is_dir() and (p / "label").is_dir()
+
+    def _normalize_data_root(p_str: str | None, arg_name: str) -> str | None:
+        if not p_str:
+            return p_str
+        p = Path(p_str)
+        name = p.name.lower()
+        if name in ("train", "val", "test"):
+            parent = p.parent
+            parent_has_splits = any((parent / s).is_dir() for s in ("train", "val", "test"))
+            looks_like_split = _has_ab_label(p) or _has_ab_label(p / p.name)
+            if parent_has_splits and looks_like_split:
+                print(f"[Data] Detected {arg_name} points to split folder '{p.name}'; using parent dataset root: {parent}")
+                return str(parent)
+        return p_str
+
+    args.data_root = _normalize_data_root(args.data_root, "--data_root")
+    args.calib_root = _normalize_data_root(args.calib_root, "--calib_root")
+
     if args.ensemble_indices:
         try:
             args.ensemble_indices = [int(x) for x in str(args.ensemble_indices).split(",") if str(x).strip() != ""]
@@ -306,6 +334,147 @@ def _fit_cvx_nll_weights(
 
 
 @torch.no_grad()
+def _collect_pixels_for_val_best_thr(
+    model: torch.nn.Module,
+    loader,
+    device: str,
+    window: int | None,
+    stride: int | None,
+    smooth_k: int,
+    max_pixels: int,
+    use_ensemble: bool,
+    ensemble_cfg: dict | None,
+):
+    """
+    Collect sampled pixels (probability, label) from loader for selecting a single global threshold.
+    Returns:
+      probs: [N] float32 on device
+      labels: [N] float32 on device
+    """
+    probs_buf = None
+    y_buf = None
+    max_pixels = int(max(1000, max_pixels))
+
+    for batch in loader:
+        img_a = batch["img_a"].to(device, non_blocking=True)
+        img_b = batch["img_b"].to(device, non_blocking=True)
+        gt = batch["label"].to(device)
+        if gt.ndim == 3:
+            gt = gt.unsqueeze(1)
+        if gt.ndim == 4 and gt.shape[1] != 1:
+            gt = gt[:, :1]
+        y = (gt > 0).float()  # [B,1,H,W]
+
+        if window is not None and stride is not None:
+            if img_a.shape[0] != 1:
+                raise ValueError("val_best with sliding window currently supports batch_size==1.")
+            prob = sliding_window_inference(
+                model=model,
+                img_a=img_a,
+                img_b=img_b,
+                window=window,
+                stride=stride,
+                device=device,
+                use_ensemble=use_ensemble,
+                ensemble_cfg=ensemble_cfg,
+            )  # [1,1,H,W]
+        else:
+            out = model(img_a, img_b)
+            if use_ensemble and isinstance(out, dict) and out.get("logits_all") is not None:
+                logits_all = out["logits_all"]  # [K,B,1,H,W]
+                cfg = ensemble_cfg or {}
+                mode = str(cfg.get("mode", "mean_prob"))
+                indices = cfg.get("indices")
+                weights = cfg.get("weights")
+                if indices is not None:
+                    idx = torch.as_tensor(indices, device=logits_all.device, dtype=torch.long)
+                    logits_all = logits_all.index_select(0, idx)
+                if mode == "mean_prob":
+                    prob = torch.sigmoid(logits_all).mean(dim=0)
+                elif mode == "mean_logit":
+                    prob = torch.sigmoid(logits_all.mean(dim=0))
+                elif mode == "weighted_logit":
+                    if weights is None:
+                        raise ValueError("ensemble_cfg.mode='weighted_logit' requires weights for val_best.")
+                    w = torch.as_tensor(weights, device=logits_all.device, dtype=logits_all.dtype)
+                    if w.ndim != 1 or w.numel() != logits_all.shape[0]:
+                        raise ValueError("val_best weights must match selected heads count.")
+                    w = (w / w.sum().clamp_min(1e-12)).view(-1, 1, 1, 1, 1)
+                    prob = torch.sigmoid((w * logits_all).sum(dim=0))
+                else:
+                    raise ValueError(f"Unknown ensemble mode for val_best: {mode}")
+            else:
+                prob = torch.sigmoid(out["pred"] if isinstance(out, dict) else out)
+
+        if smooth_k and smooth_k > 1:
+            pad = smooth_k // 2
+            prob = torch.nn.functional.avg_pool2d(prob, kernel_size=smooth_k, stride=1, padding=pad)
+
+        probs_mat = prob[:, 0].reshape(-1)
+        y_flat = y.reshape(-1).to(dtype=torch.float32)
+
+        if probs_buf is None:
+            probs_buf = probs_mat
+            y_buf = y_flat
+        else:
+            probs_buf = torch.cat([probs_buf, probs_mat], dim=0)
+            y_buf = torch.cat([y_buf, y_flat], dim=0)
+
+        if probs_buf.numel() > max_pixels:
+            perm = torch.randperm(probs_buf.numel(), device=probs_buf.device)[:max_pixels]
+            probs_buf = probs_buf.index_select(0, perm)
+            y_buf = y_buf.index_select(0, perm)
+
+    if probs_buf is None or y_buf is None:
+        raise RuntimeError("Empty loader; cannot select val_best threshold.")
+    return probs_buf.to(dtype=torch.float32), y_buf.to(dtype=torch.float32)
+
+
+def _best_thr_from_samples(probs: torch.Tensor, labels: torch.Tensor) -> tuple[float, float, int]:
+    """
+    Find a single threshold that maximizes pixel-wise F1 on sampled data.
+    preds are defined as (prob > thr).
+    Returns (thr, best_f1, k_pred_pos).
+    """
+    if probs.ndim != 1 or labels.ndim != 1 or probs.numel() != labels.numel():
+        raise ValueError("probs/labels must be 1D and same length")
+    if probs.numel() == 0:
+        return 0.5, 0.0, 0
+
+    mask = torch.isfinite(probs)
+    probs = probs[mask]
+    labels = labels[mask]
+    if probs.numel() == 0:
+        return 0.5, 0.0, 0
+
+    total_pos = float(labels.sum().item())
+    if total_pos <= 0:
+        return 1.0, 0.0, 0
+
+    order = torch.argsort(probs, descending=True)
+    p = probs.index_select(0, order)
+    y = labels.index_select(0, order)
+
+    tp = torch.cumsum(y, dim=0)
+    k = torch.arange(1, tp.numel() + 1, device=tp.device, dtype=tp.dtype)
+    fp = k - tp
+    fn = total_pos - tp
+    denom = (2 * tp + fp + fn).clamp_min(1e-12)
+    f1 = (2 * tp) / denom
+    best_i = int(torch.argmax(f1).item())
+    best_f1 = float(f1[best_i].item())
+    k_pos = int(k[best_i].item())
+
+    # Choose threshold between p[best_i] and p[best_i+1] so that exactly k_pos are > thr (ignoring ties).
+    if best_i >= p.numel() - 1:
+        thr = float(p[best_i].item()) - 1e-6
+    else:
+        thr = 0.5 * (float(p[best_i].item()) + float(p[best_i + 1].item()))
+    thr = float(max(0.0, min(1.0, thr)))
+    return thr, best_f1, k_pos
+
+
+@torch.no_grad()
 def score_heads_on_loader(
     model: torch.nn.Module,
     loader,
@@ -385,7 +554,10 @@ def main():
         cfg.device = device
     cfg.batch_size = args.batch_size
     # eval loaders: use --data_root
-    _, val_loader, test_loader = build_dataloaders(cfg)
+    _, val_loader, test_loader = build_dataloaders(cfg, require_train=False, require_val=False)
+    if val_loader is None:
+        print("[Data] No val split found; using test split as val for calibration/visualization.")
+        val_loader = test_loader
     # calibration loaders: optionally use --calib_root (e.g., source domain)
     val_loader_calib = val_loader
     if args.calib_root:
@@ -405,7 +577,10 @@ def main():
         )
         cfg_calib.batch_size = cfg.batch_size
         try:
-            _, val_loader_calib, _ = build_dataloaders(cfg_calib)
+            _, val_loader_calib, test_loader_calib = build_dataloaders(cfg_calib, require_train=False, require_val=False)
+            if val_loader_calib is None:
+                val_loader_calib = test_loader_calib
+                print("[Calib] No val split found under calib_root; using test split for calibration.")
             print(f"[Calib] Using calib_root={args.calib_root} (val size={len(val_loader_calib.dataset)})")
         except Exception as e:
             print(f"[Calib] Failed to build calib loaders from {args.calib_root}: {e}; fallback to --data_root val.")
@@ -486,12 +661,17 @@ def main():
 
     if args.use_ensemble_pred and ensemble_cfg is None and args.ensemble_strategy not in ("mean_prob", "mean_logit"):
             print("\n[Ensemble] Scoring each head on VAL to derive selection/weights...")
+            score_thr_mode = cfg.thr_mode
+            score_thr = cfg.thr
+            if score_thr_mode == "val_best":
+                score_thr_mode = "fixed"
+                score_thr = float(args.thr)
             head_metrics = score_heads_on_loader(
                 model=model,
                 loader=val_loader_calib,
                 device=device,
-                thr_mode=cfg.thr_mode,
-                thr=cfg.thr,
+                thr_mode=score_thr_mode,
+                thr=score_thr,
                 topk=cfg.topk,
                 smooth_k=cfg.smooth_k,
                 use_minarea=cfg.use_minarea,
@@ -589,6 +769,23 @@ def main():
                     )
             except Exception:
                 pass
+
+    if args.thr_mode == "val_best":
+        probs, y = _collect_pixels_for_val_best_thr(
+            model=model,
+            loader=val_loader_calib,
+            device=device,
+            window=args.window,
+            stride=args.stride,
+            smooth_k=cfg.smooth_k,
+            max_pixels=args.val_best_max_pixels,
+            use_ensemble=args.use_ensemble_pred,
+            ensemble_cfg=ensemble_cfg,
+        )
+        best_thr, best_f1, k_pos = _best_thr_from_samples(probs, y)
+        print(f"[val_best] Selected global threshold thr={best_thr:.4f} (sampled_pixels={int(probs.numel())}, pred_pos={k_pos}, best_F1={best_f1:.4f})")
+        cfg.thr_mode = "fixed"
+        cfg.thr = float(best_thr)
 
     metrics = evaluate(
         model=model,

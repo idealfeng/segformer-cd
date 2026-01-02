@@ -724,7 +724,9 @@ def save_vis_samples(
                 return
 
 
-def build_dataloaders(cfg: HeadCfg) -> Tuple[DataLoader, DataLoader, DataLoader]:
+def build_dataloaders(
+    cfg: HeadCfg, require_train: bool = True, require_val: bool = True
+) -> Tuple[Optional[DataLoader], Optional[DataLoader], DataLoader]:
     root = Path(cfg.data_root)
     train_tf = get_train_transforms(crop_size=cfg.crop_size)
     eval_tf = get_test_transforms_full() if cfg.full_eval else get_val_transforms(crop_size=cfg.eval_crop)
@@ -745,21 +747,34 @@ def build_dataloaders(cfg: HeadCfg) -> Tuple[DataLoader, DataLoader, DataLoader]
     if cfg.num_workers > 0:
         loader_kwargs["worker_init_fn"] = worker_init_fn
 
-    train_loader = DataLoader(
-        _make_dataset("train", train_tf),
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        drop_last=True,
-        **loader_kwargs,
-    )
+    train_loader = None
+    if require_train:
+        train_loader = DataLoader(
+            _make_dataset("train", train_tf),
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            drop_last=True,
+            **loader_kwargs,
+        )
     eval_batch_size = 1 if cfg.full_eval else cfg.batch_size
-    val_loader = DataLoader(
-        _make_dataset("val", eval_tf),
-        batch_size=eval_batch_size,
-        shuffle=False,
-        drop_last=False,
-        **loader_kwargs,
-    )
+    val_ds = None
+    if require_val:
+        val_ds = _make_dataset("val", eval_tf)
+    else:
+        try:
+            val_ds = _make_dataset("val", eval_tf)
+        except FileNotFoundError:
+            val_ds = None
+
+    val_loader = None
+    if val_ds is not None:
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=eval_batch_size,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
     test_loader = DataLoader(
         _make_dataset("test", eval_tf),
         batch_size=eval_batch_size,

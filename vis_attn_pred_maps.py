@@ -282,7 +282,7 @@ def _plot_grid(
         axes = [axes]
 
     for ax, (title, img) in zip(axes, cols):
-        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.set_title(title, fontsize=14, fontweight="bold")
         if img.ndim == 2:
             ax.imshow(img, cmap="gray", vmin=0, vmax=1)
         else:
