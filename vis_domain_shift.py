@@ -61,7 +61,10 @@ def _pca_2d(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _load_model(ckpt_path: str, device: str) -> torch.nn.Module:
-    ckpt = torch.load(ckpt_path, map_location=device)
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location=device)
     cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
     arch = str(cfg.get("arch", "dlv"))
     if arch == "a0":
@@ -305,14 +308,24 @@ def main():
         )
 
         if tsne_fig is not None and tsne_axes is not None:
-            tsne = TSNE(
+            import inspect
+
+            sig = inspect.signature(TSNE.__init__)
+            params = sig.parameters
+            kw = dict(
                 n_components=2,
                 perplexity=float(args.tsne_perplexity),
-                n_iter=int(args.tsne_iter),
                 init="pca",
                 learning_rate="auto",
                 random_state=int(args.seed),
             )
+            if "max_iter" in params:
+                kw["max_iter"] = int(args.tsne_iter)
+            elif "n_iter" in params:
+                kw["n_iter"] = int(args.tsne_iter)
+            else:
+                raise RuntimeError("Unsupported scikit-learn TSNE API (missing max_iter/n_iter).")
+            tsne = TSNE(**kw)
             xy = tsne.fit_transform(x.astype(np.float32))
             src_xy = xy[: src.shape[0]]
             tgt_xy = xy[src.shape[0] :]
@@ -363,4 +376,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
