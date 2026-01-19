@@ -111,8 +111,7 @@ def _plot_hist_3ch(
         ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.35)
         if c == 0:
             ax.set_ylabel("density")
-        if c == 2:
-            ax.legend(frameon=True, fontsize=9)
+        ax.legend(frameon=True, fontsize=9, loc="upper right")
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
