@@ -21,6 +21,7 @@ from dino_head_core import (
     sliding_window_inference,
     sliding_window_inference_logits_all,
     sliding_window_inference_probs_all,
+    tta_inference_prob,
     threshold_map,
     filter_small_cc,
     confusion_update,
@@ -84,7 +85,7 @@ def parse_args():
         "--ensemble_strategy",
         type=str,
         default="mean_prob",
-        choices=["mean_prob", "mean_logit", "topk", "weighted_logit", "cvx_nll"],
+        choices=["mean_prob", "mean_logit", "topk", "weighted_logit", "cvx_nll", "ugls"],
         help="Ensemble strategy when --use_ensemble_pred is set",
     )
     parser.add_argument(
@@ -123,9 +124,13 @@ def parse_args():
         choices=["auto", "none"],
         help="Use pos_weight for BCE in cvx_nll (auto uses neg/pos from sampled pixels)",
     )
+    parser.add_argument("--ugls_min_k", type=int, default=2, help="UGLS: min number of heads per pixel (ranked by VAL F1)")
+    parser.add_argument("--ugls_max_k", type=int, default=0, help="UGLS: max heads per pixel (0 = use all selected heads)")
+    parser.add_argument("--ugls_unc_power", type=float, default=1.0, help="UGLS: exponent on normalized uncertainty (>=1 is more conservative)")
     parser.add_argument("--vis", action="store_true", help="Save visualization samples")
     parser.add_argument("--vis_n", type=int, default=base.vis_n)
     parser.add_argument("--vis_dir", type=str, default=None)
+    parser.add_argument("--tta", type=str, default="none", choices=["none", "flip", "d4"], help="Test-time augmentation")
     parser.add_argument("--print_every", type=int, default=0)
     parser.add_argument(
         "--window",
@@ -350,6 +355,7 @@ def _collect_pixels_for_val_best_thr(
     max_pixels: int,
     use_ensemble: bool,
     ensemble_cfg: dict | None,
+    tta_mode: str = "none",
 ):
     """
     Collect sampled pixels (probability, label) from loader for selecting a single global threshold.
@@ -371,46 +377,19 @@ def _collect_pixels_for_val_best_thr(
             gt = gt[:, :1]
         y = (gt > 0).float()  # [B,1,H,W]
 
-        if window is not None and stride is not None:
-            if img_a.shape[0] != 1:
-                raise ValueError("val_best with sliding window currently supports batch_size==1.")
-            prob = sliding_window_inference(
-                model=model,
-                img_a=img_a,
-                img_b=img_b,
-                window=window,
-                stride=stride,
-                device=device,
-                use_ensemble=use_ensemble,
-                ensemble_cfg=ensemble_cfg,
-            )  # [1,1,H,W]
-        else:
-            out = model(img_a, img_b)
-            if use_ensemble and isinstance(out, dict) and out.get("logits_all") is not None:
-                logits_all = out["logits_all"]  # [K,B,1,H,W]
-                cfg = ensemble_cfg or {}
-                mode = str(cfg.get("mode", "mean_prob"))
-                indices = cfg.get("indices")
-                weights = cfg.get("weights")
-                if indices is not None:
-                    idx = torch.as_tensor(indices, device=logits_all.device, dtype=torch.long)
-                    logits_all = logits_all.index_select(0, idx)
-                if mode == "mean_prob":
-                    prob = torch.sigmoid(logits_all).mean(dim=0)
-                elif mode == "mean_logit":
-                    prob = torch.sigmoid(logits_all.mean(dim=0))
-                elif mode == "weighted_logit":
-                    if weights is None:
-                        raise ValueError("ensemble_cfg.mode='weighted_logit' requires weights for val_best.")
-                    w = torch.as_tensor(weights, device=logits_all.device, dtype=logits_all.dtype)
-                    if w.ndim != 1 or w.numel() != logits_all.shape[0]:
-                        raise ValueError("val_best weights must match selected heads count.")
-                    w = (w / w.sum().clamp_min(1e-12)).view(-1, 1, 1, 1, 1)
-                    prob = torch.sigmoid((w * logits_all).sum(dim=0))
-                else:
-                    raise ValueError(f"Unknown ensemble mode for val_best: {mode}")
-            else:
-                prob = torch.sigmoid(out["pred"] if isinstance(out, dict) else out)
+        if window is not None and stride is not None and img_a.shape[0] != 1:
+            raise ValueError("val_best with sliding window currently supports batch_size==1.")
+        prob = tta_inference_prob(
+            model=model,
+            img_a=img_a,
+            img_b=img_b,
+            device=device,
+            window=window,
+            stride=stride,
+            use_ensemble=use_ensemble,
+            ensemble_cfg=ensemble_cfg,
+            tta_mode=tta_mode,
+        )
 
         if smooth_k and smooth_k > 1:
             pad = smooth_k // 2
@@ -664,7 +643,7 @@ def main():
                 print(f"[Ensemble] Using fixed heads indices={args.ensemble_indices} with mode={args.ensemble_strategy}")
         else:
             if not getattr(cfg, "use_layer_ensemble", False):
-                print("[Ensemble] use_layer_ensemble=False; cannot score heads for topk/weighted/cvx strategies. Disabling ensemble.")
+                print("[Ensemble] use_layer_ensemble=False; cannot score heads for topk/weighted/cvx/ugls strategies. Disabling ensemble.")
                 args.use_ensemble_pred = False
 
     if args.use_ensemble_pred and ensemble_cfg is None and args.ensemble_strategy not in ("mean_prob", "mean_logit"):
@@ -697,6 +676,16 @@ def main():
 
             if args.ensemble_indices is not None:
                 indices = [int(i) for i in args.ensemble_indices]
+            elif args.ensemble_strategy == "ugls":
+                # UGLS uses a ranked list of candidate heads.
+                # Default: pick top-(ensemble_topk) layer heads by VAL F1 (excluding fused), then add fused.
+                layer_indices = list(range(0, max(0, fused_idx)))
+                if args.ensemble_topk and args.ensemble_topk > 0 and layer_indices:
+                    layer_sorted = sorted(layer_indices, key=lambda i: f1s[i], reverse=True)
+                    picked_layers = layer_sorted[: min(args.ensemble_topk, len(layer_sorted))]
+                else:
+                    picked_layers = layer_indices
+                indices = picked_layers + [fused_idx]
             else:
                 layer_indices = list(range(0, max(0, fused_idx)))
                 if args.ensemble_topk and args.ensemble_topk > 0 and layer_indices:
@@ -750,6 +739,21 @@ def main():
                 ensemble_cfg = {"mode": "weighted_logit", "indices": indices, "weights": w, "solver": "cvx_nll"}
                 print(f"[Ensemble] Using cvx_nll weighted_logit over heads indices={indices}")
                 print(f"[Ensemble] Weights={['{:.3f}'.format(x) for x in w]}")
+            elif args.ensemble_strategy == "ugls":
+                ranked = sorted(indices, key=lambda i: f1s[int(i)], reverse=True)
+                max_k = int(args.ugls_max_k) if int(args.ugls_max_k) > 0 else len(ranked)
+                max_k = max(1, min(max_k, len(ranked)))
+                min_k = max(1, min(int(args.ugls_min_k), max_k))
+                ensemble_cfg = {
+                    "mode": "ugls",
+                    "indices": ranked,
+                    "min_k": int(min_k),
+                    "max_k": int(max_k),
+                    "unc_power": float(args.ugls_unc_power),
+                }
+                indices = ranked
+                print(f"[Ensemble] Using UGLS ranked indices={ranked}")
+                print(f"[Ensemble] UGLS min_k={min_k} max_k={max_k} unc_power={float(args.ugls_unc_power):.3g}")
             else:
                 raise ValueError(f"Unknown ensemble_strategy: {args.ensemble_strategy}")
             try:
@@ -789,6 +793,7 @@ def main():
             max_pixels=args.val_best_max_pixels,
             use_ensemble=args.use_ensemble_pred,
             ensemble_cfg=ensemble_cfg,
+            tta_mode=str(args.tta),
         )
         best_thr, best_f1, k_pos = _best_thr_from_samples(probs, y)
         print(f"[val_best] Selected global threshold thr={best_thr:.4f} (sampled_pixels={int(probs.numel())}, pred_pos={k_pos}, best_F1={best_f1:.4f})")
@@ -810,6 +815,7 @@ def main():
         stride=args.stride,
         use_ensemble=args.use_ensemble_pred,
         ensemble_cfg=ensemble_cfg,
+        tta_mode=str(args.tta),
     )
     print("\n====== Test Metrics ======")
     for k in ["precision", "recall", "f1", "iou", "oa", "kappa"]:
@@ -833,8 +839,11 @@ def main():
             thr=cfg.thr,
             topk=cfg.topk,
             smooth_k=cfg.smooth_k,
+            window=args.window,
+            stride=args.stride,
             use_ensemble=args.use_ensemble_pred,
             ensemble_cfg=ensemble_cfg,
+            tta_mode=str(args.tta),
         )
         print(f"Saved visualizations to {vis_dir}")
 

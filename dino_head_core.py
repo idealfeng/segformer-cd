@@ -301,6 +301,9 @@ def _ensemble_prob_from_logits_all(
     mode = str(cfg.get("mode", "mean_prob"))
     indices = cfg.get("indices")
     weights = cfg.get("weights")
+    min_k = int(cfg.get("min_k", 2) or 2)
+    max_k = int(cfg.get("max_k", 0) or 0)
+    unc_power = float(cfg.get("unc_power", 1.0) or 1.0)
 
     if indices is not None:
         idx = torch.as_tensor(indices, device=logits_all.device, dtype=torch.long)
@@ -321,6 +324,42 @@ def _ensemble_prob_from_logits_all(
         w = w / w.sum().clamp_min(1e-12)
         w = w.view(-1, 1, 1, 1, 1)
         return torch.sigmoid((w * logits_all).sum(dim=0))
+    if mode == "ugls":
+        # Uncertainty-guided layer selection (UGLS):
+        # - compute pixel-wise uncertainty as variance across head probabilities
+        # - map uncertainty to a dynamic top-k (in ranked head order) per pixel
+        # - output sigmoid(mean_logit of selected heads)
+        K = int(logits_all.shape[0])
+        if K <= 1:
+            return torch.sigmoid(logits_all.squeeze(0))
+
+        if max_k <= 0 or max_k > K:
+            max_k = K
+        min_k = max(1, min(int(min_k), max_k))
+
+        probs = torch.sigmoid(logits_all)  # [K,B,1,H,W]
+        unc = probs.var(dim=0, unbiased=False)  # [B,1,H,W] in [0, 0.25]
+        unc_norm = (unc / 0.25).clamp(0.0, 1.0)
+        if unc_power != 1.0:
+            unc_norm = unc_norm.clamp_min(0.0).pow(float(unc_power))
+
+        span = max_k - min_k
+        if span <= 0:
+            # fixed k == min_k == max_k
+            sum_logits = logits_all[:max_k].sum(dim=0)
+            return torch.sigmoid(sum_logits / float(max_k))
+
+        # Map unc_norm in [0,1] to integer k in [min_k, max_k] (inclusive), using full range.
+        # Use (span+1) bins so max_k is reachable without requiring unc_norm==1 exactly.
+        k_off = torch.floor(unc_norm * float(span + 1)).to(dtype=torch.long).clamp(min=0, max=span)  # [B,1,H,W]
+        k_map = (min_k + k_off).to(dtype=torch.long)  # [B,1,H,W]
+        k_map = k_map.clamp(min=min_k, max=max_k)
+
+        cum = logits_all.cumsum(dim=0)  # [K,B,1,H,W]
+        gather_idx = (k_map - 1).clamp(min=0, max=K - 1).unsqueeze(0)  # [1,B,1,H,W]
+        sum_logits = cum.gather(0, gather_idx).squeeze(0)  # [B,1,H,W]
+        mean_logits = sum_logits / k_map.to(dtype=logits_all.dtype)
+        return torch.sigmoid(mean_logits)
     raise ValueError(f"Unknown ensemble mode: {mode}")
 
 
@@ -330,6 +369,100 @@ def _prob_from_out(out, use_ensemble: bool = False, ensemble_cfg: Optional[Dict]
             return _ensemble_prob_from_logits_all(out["logits_all"], ensemble_cfg=ensemble_cfg)
         return torch.sigmoid(out["pred"])
     return torch.sigmoid(out)
+
+
+def _apply_tta_d4(x: torch.Tensor, *, k: int, hflip: bool) -> torch.Tensor:
+    """
+    Apply D4 transform: rotate by 90*k, then optional horizontal flip.
+    x: [..., H, W]
+    """
+    k = int(k) % 4
+    if k:
+        x = torch.rot90(x, k=k, dims=(-2, -1))
+    if hflip:
+        x = torch.flip(x, dims=(-1,))
+    return x
+
+
+def _invert_tta_d4(x: torch.Tensor, *, k: int, hflip: bool) -> torch.Tensor:
+    """Inverse of _apply_tta_d4."""
+    k = int(k) % 4
+    if hflip:
+        x = torch.flip(x, dims=(-1,))
+    if k:
+        x = torch.rot90(x, k=(4 - k) % 4, dims=(-2, -1))
+    return x
+
+
+@torch.no_grad()
+def tta_inference_prob(
+    model: nn.Module,
+    img_a: torch.Tensor,
+    img_b: torch.Tensor,
+    *,
+    device: str,
+    window: Optional[int] = None,
+    stride: Optional[int] = None,
+    use_ensemble: bool = False,
+    ensemble_cfg: Optional[Dict] = None,
+    tta_mode: str = "none",
+) -> torch.Tensor:
+    """
+    TTA inference returning prob map [B,1,H,W].
+
+    tta_mode:
+      - "none": no augmentation
+      - "flip": 4-way (id, hflip, vflip, hvflip)
+      - "d4":   8-way D4 (rot0/90/180/270, each with optional hflip)
+
+    Merges by averaging probabilities (after inverting each transform back).
+    """
+    tta_mode = str(tta_mode or "none").lower()
+    if tta_mode in ("none", "off", "0", "false"):
+        if window is not None and stride is not None:
+            return sliding_window_inference(
+                model=model,
+                img_a=img_a,
+                img_b=img_b,
+                window=int(window),
+                stride=int(stride),
+                device=device,
+                use_ensemble=use_ensemble,
+                ensemble_cfg=ensemble_cfg,
+            )
+        out = model(img_a, img_b)
+        return _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
+
+    if tta_mode == "flip":
+        # id/hflip/rot180/vflip (equivalent set of 4 flip variants)
+        aug_list = [(0, False), (0, True), (2, False), (2, True)]
+    elif tta_mode in ("d4", "rot90", "flip_rot90"):
+        aug_list = [(k, f) for k in (0, 1, 2, 3) for f in (False, True)]
+    else:
+        raise ValueError(f"Unknown tta_mode: {tta_mode}")
+
+    prob_sum = None
+    for k, f in aug_list:
+        a_aug = _apply_tta_d4(img_a, k=k, hflip=f)
+        b_aug = _apply_tta_d4(img_b, k=k, hflip=f)
+        if window is not None and stride is not None:
+            prob_aug = sliding_window_inference(
+                model=model,
+                img_a=a_aug,
+                img_b=b_aug,
+                window=int(window),
+                stride=int(stride),
+                device=device,
+                use_ensemble=use_ensemble,
+                ensemble_cfg=ensemble_cfg,
+            )
+        else:
+            out = model(a_aug, b_aug)
+            prob_aug = _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
+        prob_aug = _invert_tta_d4(prob_aug, k=k, hflip=f)
+        prob_sum = prob_aug if prob_sum is None else (prob_sum + prob_aug)
+
+    return prob_sum / float(len(aug_list))
 
 
 @torch.no_grad()
@@ -604,10 +737,11 @@ def evaluate(
     use_minarea: bool,
     min_area: int,
     print_every: int = 0,
-    window: int = 256,
-    stride: int = 256,
+    window: Optional[int] = 256,
+    stride: Optional[int] = 256,
     use_ensemble: bool = False,
     ensemble_cfg: Optional[Dict] = None,
+    tta_mode: str = "none",
 ) -> Dict[str, float]:
     model.eval()
     cm = {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
@@ -619,20 +753,17 @@ def evaluate(
             gt = gt.unsqueeze(1)
         elif gt.ndim == 4 and gt.shape[1] != 1:
             gt = gt[:, :1]
-        if window is not None and stride is not None:
-            prob = sliding_window_inference(
-                model=model,
-                img_a=img_a,
-                img_b=img_b,
-                window=window,
-                stride=stride,
-                device=device,
-                use_ensemble=use_ensemble,
-                ensemble_cfg=ensemble_cfg,
-            )
-        else:
-            out = model(img_a, img_b)
-            prob = _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
+        prob = tta_inference_prob(
+            model=model,
+            img_a=img_a,
+            img_b=img_b,
+            device=device,
+            window=window,
+            stride=stride,
+            use_ensemble=use_ensemble,
+            ensemble_cfg=ensemble_cfg,
+            tta_mode=tta_mode,
+        )
         if smooth_k and smooth_k > 1:
             pad = smooth_k // 2
             prob = F.avg_pool2d(prob, kernel_size=smooth_k, stride=1, padding=pad)
@@ -666,6 +797,7 @@ def save_vis_samples(
     stride: Optional[int] = None,
     use_ensemble: bool = False,
     ensemble_cfg: Optional[Dict] = None,
+    tta_mode: str = "none",
 ):
     import matplotlib.pyplot as plt
     ensure_dir(out_dir)
@@ -678,20 +810,17 @@ def save_vis_samples(
         img_b = batch["img_b"].to(device)
         gt = batch["label"]
         names = batch["name"]
-        if window is not None and stride is not None:
-            prob = sliding_window_inference(
-                model=model,
-                img_a=img_a,
-                img_b=img_b,
-                window=window,
-                stride=stride,
-                device=device,
-                use_ensemble=use_ensemble,
-                ensemble_cfg=ensemble_cfg,
-            )
-        else:
-            out = model(img_a, img_b)
-            prob = _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
+        prob = tta_inference_prob(
+            model=model,
+            img_a=img_a,
+            img_b=img_b,
+            device=device,
+            window=window,
+            stride=stride,
+            use_ensemble=use_ensemble,
+            ensemble_cfg=ensemble_cfg,
+            tta_mode=tta_mode,
+        )
         if smooth_k and smooth_k > 1:
             pad = smooth_k // 2
             prob = F.avg_pool2d(prob, kernel_size=smooth_k, stride=1, padding=pad)
