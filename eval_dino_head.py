@@ -49,6 +49,12 @@ def parse_args():
     parser.add_argument("--out_dir", type=str, default=None, help="目录为空则默认与 checkpoint 同级")
     parser.add_argument("--device", type=str, default=base.device, help="cuda|cpu|auto")
     parser.add_argument("--batch_size", type=int, default=2, help="Eval batch size (use 1 for full images)")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=base.num_workers,
+        help="DataLoader workers. Set to 0 if multiprocessing is not permitted in your environment.",
+    )
     parser.add_argument("--full_eval", dest="full_eval", action="store_true")
     parser.add_argument("--no_full_eval", dest="full_eval", action="store_false")
     parser.set_defaults(full_eval=base.full_eval)
@@ -553,6 +559,7 @@ def main():
         device = "cpu"
         cfg.device = device
     cfg.batch_size = args.batch_size
+    cfg.num_workers = int(getattr(args, "num_workers", cfg.num_workers))
     # eval loaders: use --data_root
     _, val_loader, test_loader = build_dataloaders(cfg, require_train=False, require_val=False)
     if val_loader is None:
@@ -565,6 +572,7 @@ def main():
             data_root=args.calib_root,
             out_dir=cfg.out_dir,
             device=cfg.device,
+            num_workers=cfg.num_workers,
             full_eval=cfg.full_eval,
             eval_crop=cfg.eval_crop,
             thr_mode=cfg.thr_mode,

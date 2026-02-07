@@ -9,6 +9,7 @@ import json
 import os
 import time
 from dataclasses import asdict
+from dataclasses import fields
 
 import torch
 
@@ -24,6 +25,21 @@ from dino_head_core import (
     save_vis_samples,
     build_scheduler,  # ← 这一行补上
 )
+
+def _load_cfg_defaults_from_json(path: str) -> HeadCfg:
+    base = HeadCfg()
+    if not path:
+        return base
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load --config JSON: {path}: {e}")
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"--config must be a JSON object: {path}")
+    keys = {f.name for f in fields(HeadCfg)}
+    filtered = {k: v for k, v in raw.items() if k in keys}
+    return HeadCfg(**filtered)
 
 def _get_backbone_blocks(backbone):
     """
@@ -87,8 +103,13 @@ def _configure_backbone_finetune(model: torch.nn.Module, ft_mode: str, ft_k: int
 
 
 def parse_args():
-    base = HeadCfg()
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default=None, help="Path to a JSON config (e.g., out_dir/config.json) to use as defaults.")
+    pre_args, _ = pre.parse_known_args()
+    base = _load_cfg_defaults_from_json(str(pre_args.config)) if pre_args.config else HeadCfg()
+
     parser = argparse.ArgumentParser(description="Train DINOv2 change-detection head")
+    parser.add_argument("--config", type=str, default=None, help="Path to a JSON config to use as defaults.")
     parser.add_argument("--data_root", type=str, default=base.data_root)
     parser.add_argument("--out_dir", type=str, default=base.out_dir)
     parser.add_argument("--device", type=str, default=base.device, help="cuda|cpu|auto")
