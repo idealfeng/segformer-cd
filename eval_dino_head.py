@@ -22,6 +22,7 @@ from dino_head_core import (
     sliding_window_inference_logits_all,
     sliding_window_inference_probs_all,
     tta_inference_prob,
+    apply_corruption_pair,
     threshold_map,
     filter_small_cc,
     confusion_update,
@@ -85,7 +86,7 @@ def parse_args():
         "--ensemble_strategy",
         type=str,
         default="mean_prob",
-        choices=["mean_prob", "mean_logit", "topk", "weighted_logit", "cvx_nll", "ugls"],
+        choices=["mean_prob", "mean_logit", "topk", "weighted_logit", "cvx_nll", "ugls", "consis2", "consisk", "uwi"],
         help="Ensemble strategy when --use_ensemble_pred is set",
     )
     parser.add_argument(
@@ -127,10 +128,37 @@ def parse_args():
     parser.add_argument("--ugls_min_k", type=int, default=2, help="UGLS: min number of heads per pixel (ranked by VAL F1)")
     parser.add_argument("--ugls_max_k", type=int, default=0, help="UGLS: max heads per pixel (0 = use all selected heads)")
     parser.add_argument("--ugls_unc_power", type=float, default=1.0, help="UGLS: exponent on normalized uncertainty (>=1 is more conservative)")
+    parser.add_argument("--consis2_d0", type=float, default=0.05, help="consis2: disagreement low threshold")
+    parser.add_argument("--consis2_d1", type=float, default=0.25, help="consis2: disagreement high threshold")
+    parser.add_argument("--consis2_gamma", type=float, default=1.0, help="consis2: nonlinearity on mapped disagreement")
+    parser.add_argument("--consis2_max_w", type=float, default=0.5, help="consis2: max blend weight towards the non-anchor head")
+    parser.add_argument("--consisk_temp0", type=float, default=0.03, help="consisk: base softmax temperature")
+    parser.add_argument("--consisk_temp1", type=float, default=0.20, help="consisk: temperature scale with uncertainty")
+    parser.add_argument("--consisk_gamma", type=float, default=1.0, help="consisk: exponent on uncertainty normalization")
+    parser.add_argument("--consisk_fused_bias", type=float, default=0.0, help="consisk: additive bias to fused head score (after selection)")
+    parser.add_argument("--uwi_unc_indices", type=str, default=None, help="UWI: comma-separated head indices for uncertainty Var(p) (default: all heads)")
+    parser.add_argument("--uwi_u0", type=float, default=0.10, help="UWI: uncertainty lower threshold (normalized to [0,1])")
+    parser.add_argument("--uwi_u1", type=float, default=0.60, help="UWI: uncertainty upper threshold (normalized to [0,1])")
+    parser.add_argument("--uwi_gamma", type=float, default=1.0, help="UWI: nonlinearity on mapped uncertainty")
+    parser.add_argument("--uwi_max_w", type=float, default=0.50, help="UWI: max blend weight towards the non-anchor head")
+    parser.add_argument("--uwi_gate_smooth_k", type=int, default=0, help="UWI: optional spatial smoothing kernel for gate g(x)")
     parser.add_argument("--vis", action="store_true", help="Save visualization samples")
     parser.add_argument("--vis_n", type=int, default=base.vis_n)
     parser.add_argument("--vis_dir", type=str, default=None)
     parser.add_argument("--tta", type=str, default="none", choices=["none", "flip", "d4"], help="Test-time augmentation")
+    parser.add_argument(
+        "--corrupt",
+        type=str,
+        default="none",
+        choices=["none", "gaussian", "bc", "jpeg"],
+        help="Test-time corruption applied to inputs (image-space, then re-normalized).",
+    )
+    parser.add_argument("--corrupt_pair", type=str, default="correlated", choices=["correlated", "uncorrelated"])
+    parser.add_argument("--corrupt_seed", type=int, default=0)
+    parser.add_argument("--gaussian_sigma", type=float, default=0.0, help="Gaussian noise std in [0,1] space")
+    parser.add_argument("--bc_brightness", type=float, default=0.0, help="Brightness shift magnitude in [0,1] space")
+    parser.add_argument("--bc_contrast", type=float, default=0.0, help="Contrast delta: c ~ U(1-d,1+d)")
+    parser.add_argument("--jpeg_quality", type=int, default=75, help="JPEG quality (1..95)")
     parser.add_argument("--print_every", type=int, default=0)
     parser.add_argument(
         "--window",
@@ -356,6 +384,13 @@ def _collect_pixels_for_val_best_thr(
     use_ensemble: bool,
     ensemble_cfg: dict | None,
     tta_mode: str = "none",
+    corrupt: str = "none",
+    corrupt_pair: str = "correlated",
+    corrupt_seed: int = 0,
+    gaussian_sigma: float = 0.0,
+    bc_brightness: float = 0.0,
+    bc_contrast: float = 0.0,
+    jpeg_quality: int = 75,
 ):
     """
     Collect sampled pixels (probability, label) from loader for selecting a single global threshold.
@@ -370,6 +405,18 @@ def _collect_pixels_for_val_best_thr(
     for batch in loader:
         img_a = batch["img_a"].to(device, non_blocking=True)
         img_b = batch["img_b"].to(device, non_blocking=True)
+        if corrupt and str(corrupt).lower() not in ("none", "off", "0", "false"):
+            img_a, img_b = apply_corruption_pair(
+                img_a,
+                img_b,
+                mode=str(corrupt),
+                pair_mode=str(corrupt_pair),
+                seed=int(corrupt_seed) + int(img_a.shape[0]),
+                gaussian_sigma=float(gaussian_sigma),
+                bc_brightness=float(bc_brightness),
+                bc_contrast=float(bc_contrast),
+                jpeg_quality=int(jpeg_quality),
+            )
         gt = batch["label"].to(device)
         if gt.ndim == 3:
             gt = gt.unsqueeze(1)
@@ -641,6 +688,103 @@ def main():
             if args.ensemble_indices is not None:
                 ensemble_cfg["indices"] = args.ensemble_indices
                 print(f"[Ensemble] Using fixed heads indices={args.ensemble_indices} with mode={args.ensemble_strategy}")
+        elif args.ensemble_strategy in ("consis2", "consisk"):
+            # Consistency-driven dynamic weighting (no labels; no target calibration).
+            if not getattr(cfg, "use_layer_ensemble", False):
+                print("[Ensemble] use_layer_ensemble=False; cannot use consis2/consisk. Disabling ensemble.")
+                args.use_ensemble_pred = False
+            else:
+                # Default indices:
+                # - consis2: [deepest_layer_head, fused]
+                # - consisk: all heads
+                K = len(cfg.selected_layers) + 1 if isinstance(cfg.selected_layers, (list, tuple)) else None
+                if args.ensemble_indices is not None:
+                    indices = [int(i) for i in args.ensemble_indices]
+                else:
+                    if args.ensemble_strategy == "consis2":
+                        if K is None:
+                            raise ValueError("consis2 requires selected_layers to be known.")
+                        indices = [K - 2, K - 1]
+                    else:
+                        if K is None:
+                            raise ValueError("consisk requires selected_layers to be known.")
+                        indices = list(range(0, K))
+
+                if args.ensemble_strategy == "consis2":
+                    if len(indices) != 2:
+                        raise ValueError(f"consis2 requires exactly 2 indices, got {indices}")
+                    if K is not None:
+                        fused_idx = K - 1
+                        if fused_idx in indices and indices[-1] != fused_idx:
+                            # reorder to [other, fused] so anchor is fused in dino_head_core
+                            other = [i for i in indices if i != fused_idx][0]
+                            indices = [other, fused_idx]
+                    ensemble_cfg = {
+                        "mode": "consis2",
+                        "indices": indices,
+                        "d0": float(args.consis2_d0),
+                        "d1": float(args.consis2_d1),
+                        "gamma": float(args.consis2_gamma),
+                        "max_w": float(args.consis2_max_w),
+                    }
+                    print(f"[Ensemble] Using consis2 indices={indices} (anchor=head[1])")
+                else:
+                    fused_local_idx = -1
+                    if K is not None:
+                        fused_idx = K - 1
+                        if fused_idx in indices:
+                            fused_local_idx = int(indices.index(fused_idx))
+                    ensemble_cfg = {
+                        "mode": "consisk",
+                        "indices": indices,
+                        "temp0": float(args.consisk_temp0),
+                        "temp1": float(args.consisk_temp1),
+                        "gamma": float(args.consisk_gamma),
+                        "fused_local_idx": int(fused_local_idx),
+                        "fused_bias": float(args.consisk_fused_bias),
+                    }
+                    print(
+                        f"[Ensemble] Using consisk indices={indices} (fused_local_idx={fused_local_idx}, "
+                        f"temp0={float(args.consisk_temp0):.3g} temp1={float(args.consisk_temp1):.3g})"
+                    )
+        elif args.ensemble_strategy == "uwi":
+            if not getattr(cfg, "use_layer_ensemble", False):
+                print("[Ensemble] use_layer_ensemble=False; cannot use uwi. Disabling ensemble.")
+                args.use_ensemble_pred = False
+            else:
+                # Fuse indices: default deepest + fused, or use --ensemble_indices (must be 2).
+                K = len(cfg.selected_layers) + 1 if isinstance(cfg.selected_layers, (list, tuple)) else None
+                if args.ensemble_indices is not None:
+                    fuse_indices = [int(i) for i in args.ensemble_indices]
+                else:
+                    if K is None:
+                        raise ValueError("uwi requires selected_layers to be known.")
+                    fuse_indices = [K - 2, K - 1]
+                if len(fuse_indices) != 2:
+                    raise ValueError(f"uwi requires exactly 2 fuse indices, got {fuse_indices}")
+                if K is not None:
+                    fused_idx = K - 1
+                    if fused_idx in fuse_indices and fuse_indices[-1] != fused_idx:
+                        other = [i for i in fuse_indices if i != fused_idx][0]
+                        fuse_indices = [other, fused_idx]  # [other, anchor=fused]
+
+                unc_indices = None
+                if args.uwi_unc_indices:
+                    unc_indices = [int(x) for x in str(args.uwi_unc_indices).split(",") if str(x).strip() != ""]
+                elif K is not None:
+                    unc_indices = list(range(0, K))
+
+                ensemble_cfg = {
+                    "mode": "uw_gate",
+                    "fuse_indices": fuse_indices,
+                    "unc_indices": unc_indices,
+                    "u0": float(args.uwi_u0),
+                    "u1": float(args.uwi_u1),
+                    "gamma": float(args.uwi_gamma),
+                    "max_w": float(args.uwi_max_w),
+                    "gate_smooth_k": int(args.uwi_gate_smooth_k),
+                }
+                print(f"[Ensemble] Using UWI fuse_indices={fuse_indices} unc_indices={unc_indices}")
         else:
             if not getattr(cfg, "use_layer_ensemble", False):
                 print("[Ensemble] use_layer_ensemble=False; cannot score heads for topk/weighted/cvx/ugls strategies. Disabling ensemble.")
@@ -794,6 +938,13 @@ def main():
             use_ensemble=args.use_ensemble_pred,
             ensemble_cfg=ensemble_cfg,
             tta_mode=str(args.tta),
+            corrupt=str(args.corrupt),
+            corrupt_pair=str(args.corrupt_pair),
+            corrupt_seed=int(args.corrupt_seed),
+            gaussian_sigma=float(args.gaussian_sigma),
+            bc_brightness=float(args.bc_brightness),
+            bc_contrast=float(args.bc_contrast),
+            jpeg_quality=int(args.jpeg_quality),
         )
         best_thr, best_f1, k_pos = _best_thr_from_samples(probs, y)
         print(f"[val_best] Selected global threshold thr={best_thr:.4f} (sampled_pixels={int(probs.numel())}, pred_pos={k_pos}, best_F1={best_f1:.4f})")
@@ -816,6 +967,13 @@ def main():
         use_ensemble=args.use_ensemble_pred,
         ensemble_cfg=ensemble_cfg,
         tta_mode=str(args.tta),
+        corrupt=str(args.corrupt),
+        corrupt_pair=str(args.corrupt_pair),
+        corrupt_seed=int(args.corrupt_seed),
+        gaussian_sigma=float(args.gaussian_sigma),
+        bc_brightness=float(args.bc_brightness),
+        bc_contrast=float(args.bc_contrast),
+        jpeg_quality=int(args.jpeg_quality),
     )
     print("\n====== Test Metrics ======")
     for k in ["precision", "recall", "f1", "iou", "oa", "kappa"]:
@@ -844,6 +1002,13 @@ def main():
             use_ensemble=args.use_ensemble_pred,
             ensemble_cfg=ensemble_cfg,
             tta_mode=str(args.tta),
+            corrupt=str(args.corrupt),
+            corrupt_pair=str(args.corrupt_pair),
+            corrupt_seed=int(args.corrupt_seed),
+            gaussian_sigma=float(args.gaussian_sigma),
+            bc_brightness=float(args.bc_brightness),
+            bc_contrast=float(args.bc_contrast),
+            jpeg_quality=int(args.jpeg_quality),
         )
         print(f"Saved visualizations to {vis_dir}")
 

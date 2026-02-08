@@ -305,7 +305,7 @@ def _ensemble_prob_from_logits_all(
     max_k = int(cfg.get("max_k", 0) or 0)
     unc_power = float(cfg.get("unc_power", 1.0) or 1.0)
 
-    if indices is not None:
+    if indices is not None and mode not in ("uw_gate",):
         idx = torch.as_tensor(indices, device=logits_all.device, dtype=torch.long)
         logits_all = logits_all.index_select(0, idx)
 
@@ -360,6 +360,101 @@ def _ensemble_prob_from_logits_all(
         sum_logits = cum.gather(0, gather_idx).squeeze(0)  # [B,1,H,W]
         mean_logits = sum_logits / k_map.to(dtype=logits_all.dtype)
         return torch.sigmoid(mean_logits)
+    if mode == "consis2":
+        # Consistency-driven dynamic weighting between two heads.
+        # Expects selected heads K'==2 (e.g., [deepest_layer_head, fused]).
+        # Let d = |p0 - p1|. Use d to control blend weight w in [0, max_w].
+        # Output sigmoid((1-w)*logit1 + w*logit0), where logit1 is treated as the "anchor" (usually fused).
+        if logits_all.shape[0] != 2:
+            raise ValueError(f"consis2 requires exactly 2 heads after selection, got K'={int(logits_all.shape[0])}")
+        d0 = float(cfg.get("d0", 0.05))
+        d1 = float(cfg.get("d1", 0.25))
+        gamma = float(cfg.get("gamma", 1.0))
+        max_w = float(cfg.get("max_w", 0.5))
+        eps = 1e-6
+        if d1 <= d0:
+            d1 = d0 + 1e-3
+        p = torch.sigmoid(logits_all)  # [2,B,1,H,W]
+        d = (p[0] - p[1]).abs()  # [B,1,H,W] in [0,1]
+        g = ((d - d0) / (d1 - d0 + eps)).clamp(0.0, 1.0)
+        if gamma != 1.0:
+            g = g.pow(gamma)
+        w = (max_w * g).to(dtype=logits_all.dtype)  # [B,1,H,W]
+        logit = (1.0 - w) * logits_all[1] + w * logits_all[0]
+        return torch.sigmoid(logit)
+    if mode == "consisk":
+        # Consistency-driven per-pixel soft weighting over K' heads.
+        # Weights are computed by how close each head's prob is to the mean prob (consensus),
+        # with a temperature that increases with uncertainty (var across heads).
+        temp0 = float(cfg.get("temp0", 0.03))
+        temp1 = float(cfg.get("temp1", 0.20))
+        gamma = float(cfg.get("gamma", 1.0))
+        fused_local_idx = int(cfg.get("fused_local_idx", -1))
+        fused_bias = float(cfg.get("fused_bias", 0.0))
+        eps = 1e-6
+
+        probs = torch.sigmoid(logits_all)  # [K',B,1,H,W]
+        p_mean = probs.mean(dim=0, keepdim=True)  # [1,B,1,H,W]
+        dev = (probs - p_mean).abs()  # [K',B,1,H,W]
+        score = -dev  # higher is better (closer to consensus)
+        if fused_bias and fused_local_idx >= 0 and fused_local_idx < int(score.shape[0]):
+            score[fused_local_idx] = score[fused_local_idx] + float(fused_bias)
+
+        unc = probs.var(dim=0, unbiased=False)  # [B,1,H,W] in [0,0.25]
+        unc_norm = (unc / 0.25).clamp(0.0, 1.0)
+        if gamma != 1.0:
+            unc_norm = unc_norm.pow(gamma)
+        temp = (temp0 + temp1 * unc_norm).clamp_min(eps).to(dtype=logits_all.dtype)  # [B,1,H,W]
+        w = torch.softmax(score / temp.unsqueeze(0), dim=0)  # [K',B,1,H,W]
+        logit = (w * logits_all).sum(dim=0)
+        return torch.sigmoid(logit)
+    if mode == "uw_gate":
+        # Uncertainty-weighted inference gate:
+        # - compute pixel-wise uncertainty u(x)=Var_k(p_k(x)) over unc_indices
+        # - map u to gate g in [0, max_w]
+        # - blend two logits: (1-g)*anchor + g*other
+        fuse_indices = cfg.get("fuse_indices", None)
+        unc_indices = cfg.get("unc_indices", None)
+        u0 = float(cfg.get("u0", 0.10))
+        u1 = float(cfg.get("u1", 0.60))
+        gamma = float(cfg.get("gamma", 1.0))
+        max_w = float(cfg.get("max_w", 0.50))
+        gate_smooth_k = int(cfg.get("gate_smooth_k", 0) or 0)
+
+        K = int(logits_all.shape[0])
+        if fuse_indices is None:
+            fuse_indices = [max(0, K - 2), max(0, K - 1)]
+        if not (isinstance(fuse_indices, (list, tuple)) and len(fuse_indices) == 2):
+            raise ValueError("uw_gate requires fuse_indices=[other, anchor] with length 2")
+        other_idx, anchor_idx = int(fuse_indices[0]), int(fuse_indices[1])
+        if any(i < 0 or i >= K for i in (other_idx, anchor_idx)):
+            raise ValueError(f"uw_gate fuse_indices out of range: {fuse_indices} for K={K}")
+
+        if unc_indices is None:
+            unc_indices = list(range(K))
+        if not isinstance(unc_indices, (list, tuple)) or len(unc_indices) < 2:
+            raise ValueError("uw_gate requires unc_indices with length >= 2")
+        unc_indices = [int(i) for i in unc_indices]
+        if any(i < 0 or i >= K for i in unc_indices):
+            raise ValueError(f"uw_gate unc_indices out of range: {unc_indices} for K={K}")
+
+        probs_unc = torch.sigmoid(logits_all.index_select(0, torch.as_tensor(unc_indices, device=logits_all.device)))
+        u = probs_unc.var(dim=0, unbiased=False)  # [B,1,H,W] in [0,0.25]
+        u_norm = (u / 0.25).clamp(0.0, 1.0)
+        if u1 <= u0:
+            u1 = u0 + 1e-3
+        g = ((u_norm - u0) / (u1 - u0)).clamp(0.0, 1.0)
+        if gamma != 1.0:
+            g = g.pow(gamma)
+        g = (float(max_w) * g).to(dtype=logits_all.dtype)  # [B,1,H,W]
+        if gate_smooth_k and gate_smooth_k > 1:
+            pad = gate_smooth_k // 2
+            g = F.avg_pool2d(g, kernel_size=gate_smooth_k, stride=1, padding=pad)
+
+        logit_other = logits_all[other_idx]
+        logit_anchor = logits_all[anchor_idx]
+        logit = (1.0 - g) * logit_anchor + g * logit_other
+        return torch.sigmoid(logit)
     raise ValueError(f"Unknown ensemble mode: {mode}")
 
 
@@ -369,6 +464,141 @@ def _prob_from_out(out, use_ensemble: bool = False, ensemble_cfg: Optional[Dict]
             return _ensemble_prob_from_logits_all(out["logits_all"], ensemble_cfg=ensemble_cfg)
         return torch.sigmoid(out["pred"])
     return torch.sigmoid(out)
+
+# ImageNet normalization used by dataset.py
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+
+
+def _denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
+    mean = _IMAGENET_MEAN.to(device=x.device, dtype=x.dtype)
+    std = _IMAGENET_STD.to(device=x.device, dtype=x.dtype)
+    return x * std + mean
+
+
+def _norm_imagenet(x: torch.Tensor) -> torch.Tensor:
+    mean = _IMAGENET_MEAN.to(device=x.device, dtype=x.dtype)
+    std = _IMAGENET_STD.to(device=x.device, dtype=x.dtype)
+    return (x - mean) / std
+
+
+def _jpeg_compress_batch(x01: torch.Tensor, quality: int) -> torch.Tensor:
+    """
+    x01: [B,3,H,W] in [0,1] (float). Returns float in [0,1].
+    Uses PIL JPEG encode/decode on CPU for realism.
+    """
+    from io import BytesIO
+
+    try:
+        from PIL import Image
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(f"PIL is required for JPEG corruption: {e}")
+
+    quality = int(max(1, min(95, int(quality))))
+    x_cpu = (x01.clamp(0, 1) * 255.0).to(dtype=torch.uint8, device="cpu")
+    out_list: List[torch.Tensor] = []
+    for i in range(int(x_cpu.shape[0])):
+        arr = x_cpu[i].permute(1, 2, 0).contiguous().numpy()
+        img = Image.fromarray(arr, mode="RGB")
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        buf.seek(0)
+        img2 = Image.open(buf).convert("RGB")
+        arr2 = np.asarray(img2, dtype=np.uint8).copy()
+        t = torch.from_numpy(arr2).permute(2, 0, 1).contiguous()
+        out_list.append(t)
+    out = torch.stack(out_list, dim=0).to(dtype=torch.float32) / 255.0
+    return out.to(device=x01.device)
+
+
+def apply_corruption_pair(
+    img_a: torch.Tensor,
+    img_b: torch.Tensor,
+    *,
+    mode: str = "none",
+    pair_mode: str = "correlated",
+    seed: int = 0,
+    gaussian_sigma: float = 0.0,
+    bc_brightness: float = 0.0,
+    bc_contrast: float = 0.0,
+    jpeg_quality: int = 75,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply synthetic test-time corruptions on normalized tensors.
+
+    img_a/img_b: [B,3,H,W], assumed ImageNet-normalized.
+
+    mode:
+      - none
+      - gaussian: add N(0, sigma^2) in [0,1] space
+      - bc: brightness/contrast: y = (x-0.5)*c + 0.5 + b
+      - jpeg: JPEG encode/decode in [0,1] space
+
+    pair_mode:
+      - correlated: same random params per sample for (A,B)
+      - uncorrelated: independent params for A and B
+    """
+    mode = str(mode or "none").lower()
+    if mode in ("none", "off", "0", "false"):
+        return img_a, img_b
+
+    pair_mode = str(pair_mode or "correlated").lower()
+    if pair_mode not in ("correlated", "uncorrelated"):
+        raise ValueError("pair_mode must be correlated|uncorrelated")
+
+    g = torch.Generator(device=img_a.device)
+    g.manual_seed(int(seed))
+
+    a01 = _denorm_imagenet(img_a).clamp(0.0, 1.0)
+    b01 = _denorm_imagenet(img_b).clamp(0.0, 1.0)
+
+    B = int(a01.shape[0])
+    if mode == "gaussian":
+        sigma = float(gaussian_sigma)
+        if sigma <= 0:
+            return img_a, img_b
+        if pair_mode == "correlated":
+            n = torch.randn(a01.shape, device=a01.device, generator=g, dtype=a01.dtype)
+            a01 = (a01 + sigma * n).clamp(0.0, 1.0)
+            b01 = (b01 + sigma * n).clamp(0.0, 1.0)
+        else:
+            na = torch.randn(a01.shape, device=a01.device, generator=g, dtype=a01.dtype)
+            nb = torch.randn(b01.shape, device=b01.device, generator=g, dtype=b01.dtype)
+            a01 = (a01 + sigma * na).clamp(0.0, 1.0)
+            b01 = (b01 + sigma * nb).clamp(0.0, 1.0)
+    elif mode in ("bc", "brightness_contrast", "bri_contrast"):
+        bmax = float(bc_brightness)
+        cmax = float(bc_contrast)
+        if bmax <= 0 and cmax <= 0:
+            return img_a, img_b
+
+        def _sample_bc():
+            bb = (torch.rand((B, 1, 1, 1), device=a01.device, generator=g, dtype=a01.dtype) * 2 - 1.0) * bmax
+            if cmax > 0:
+                cc = 1.0 + (torch.rand((B, 1, 1, 1), device=a01.device, generator=g, dtype=a01.dtype) * 2 - 1.0) * cmax
+                cc = cc.clamp(0.1, 3.0)
+            else:
+                cc = torch.ones((B, 1, 1, 1), device=a01.device, dtype=a01.dtype)
+            return bb, cc
+
+        if pair_mode == "correlated":
+            bb, cc = _sample_bc()
+            a01 = ((a01 - 0.5) * cc + 0.5 + bb).clamp(0.0, 1.0)
+            b01 = ((b01 - 0.5) * cc + 0.5 + bb).clamp(0.0, 1.0)
+        else:
+            bb1, cc1 = _sample_bc()
+            bb2, cc2 = _sample_bc()
+            a01 = ((a01 - 0.5) * cc1 + 0.5 + bb1).clamp(0.0, 1.0)
+            b01 = ((b01 - 0.5) * cc2 + 0.5 + bb2).clamp(0.0, 1.0)
+    elif mode == "jpeg":
+        q = int(jpeg_quality)
+        # same quality; encode/decode separately per image
+        a01 = _jpeg_compress_batch(a01, quality=q).clamp(0.0, 1.0)
+        b01 = _jpeg_compress_batch(b01, quality=q).clamp(0.0, 1.0)
+    else:
+        raise ValueError(f"Unknown corruption mode: {mode}")
+
+    return _norm_imagenet(a01), _norm_imagenet(b01)
 
 
 def _apply_tta_d4(x: torch.Tensor, *, k: int, hflip: bool) -> torch.Tensor:
@@ -742,12 +972,31 @@ def evaluate(
     use_ensemble: bool = False,
     ensemble_cfg: Optional[Dict] = None,
     tta_mode: str = "none",
+    corrupt: str = "none",
+    corrupt_pair: str = "correlated",
+    corrupt_seed: int = 0,
+    gaussian_sigma: float = 0.0,
+    bc_brightness: float = 0.0,
+    bc_contrast: float = 0.0,
+    jpeg_quality: int = 75,
 ) -> Dict[str, float]:
     model.eval()
     cm = {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
     for i, batch in enumerate(loader, 1):
         img_a = batch["img_a"].to(device, non_blocking=True)
         img_b = batch["img_b"].to(device, non_blocking=True)
+        if corrupt and str(corrupt).lower() not in ("none", "off", "0", "false"):
+            img_a, img_b = apply_corruption_pair(
+                img_a,
+                img_b,
+                mode=str(corrupt),
+                pair_mode=str(corrupt_pair),
+                seed=int(corrupt_seed) + int(i),
+                gaussian_sigma=float(gaussian_sigma),
+                bc_brightness=float(bc_brightness),
+                bc_contrast=float(bc_contrast),
+                jpeg_quality=int(jpeg_quality),
+            )
         gt = batch["label"]
         if gt.ndim == 3:
             gt = gt.unsqueeze(1)
@@ -798,6 +1047,13 @@ def save_vis_samples(
     use_ensemble: bool = False,
     ensemble_cfg: Optional[Dict] = None,
     tta_mode: str = "none",
+    corrupt: str = "none",
+    corrupt_pair: str = "correlated",
+    corrupt_seed: int = 0,
+    gaussian_sigma: float = 0.0,
+    bc_brightness: float = 0.0,
+    bc_contrast: float = 0.0,
+    jpeg_quality: int = 75,
 ):
     import matplotlib.pyplot as plt
     ensure_dir(out_dir)
@@ -808,6 +1064,18 @@ def save_vis_samples(
     for batch in loader:
         img_a = batch["img_a"].to(device)
         img_b = batch["img_b"].to(device)
+        if corrupt and str(corrupt).lower() not in ("none", "off", "0", "false"):
+            img_a, img_b = apply_corruption_pair(
+                img_a,
+                img_b,
+                mode=str(corrupt),
+                pair_mode=str(corrupt_pair),
+                seed=int(corrupt_seed) + int(saved),
+                gaussian_sigma=float(gaussian_sigma),
+                bc_brightness=float(bc_brightness),
+                bc_contrast=float(bc_contrast),
+                jpeg_quality=int(jpeg_quality),
+            )
         gt = batch["label"]
         names = batch["name"]
         prob = tta_inference_prob(
