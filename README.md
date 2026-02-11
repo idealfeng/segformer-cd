@@ -1,4 +1,77 @@
-# SAM蒸馏遥感图像分割项目
+# DLV-CD: Frozen DINOv3 Change Detection (Zero-shot Transfer)
+
+This repo contains training/evaluation code for a lightweight change-detection head on top of a **frozen DINOv3** backbone (bi-temporal input).
+
+**Main entrypoints**
+- `train_dino_head.py`: train on a source dataset
+- `eval_dino_head.py`: evaluate in-domain / cross-domain
+- `tools/sweep_eval_zeroshot.py`: optional sweep helper for inference-time settings
+
+## Install
+
+```bash
+pip install -r requirements.txt
+```
+
+Notes:
+- First run may download the DINOv3 backbone via HuggingFace `transformers`. For offline runs, download once and set `--dino_name` to a local folder.
+- On Windows / restricted environments, use `--num_workers 0`.
+
+## Data layout
+
+Place datasets under `data/`:
+
+```
+data/<DATASET>/
+  train/{A,B,label}/
+  val/{A,B,label}/
+  test/{A,B,label}/
+```
+
+Folder-name aliases (e.g., `Image1/Image2`) are supported; see `dataset.py`.
+
+## Train (source domain)
+
+```bash
+python train_dino_head.py ^
+  --data_root data/LEVIR-CD ^
+  --out_dir outputs/levir_train ^
+  --device cuda --epochs 200 --batch_size 8 --crop_size 256 ^
+  --use_layer_ensemble --layer_head_ch 128
+```
+
+## Evaluate (strict zero-shot)
+
+Use a fixed threshold and a fixed inference pipeline:
+
+```bash
+python eval_dino_head.py ^
+  --checkpoint outputs/levir_train/best.pt ^
+  --data_root data/WHUCD ^
+  --device cuda --batch_size 1 --num_workers 0 ^
+  --no_full_eval --eval_crop 256 ^
+  --thr_mode fixed --thr 0.5 ^
+  --use_ensemble_pred --ensemble_strategy mean_logit --ensemble_indices 3,4
+```
+
+Leakage warning:
+- `--thr_mode val_best` uses GT labels on VAL to search the best threshold. Do **not** run it on the target domain if you want strict zero-shot.
+
+## Open-source checklist
+
+- `data/` and `outputs/` are ignored by `.gitignore` (recommended for open-source).
+- `.gitignore` does **not** remove files that are already tracked. If your git index already contains large artifacts (e.g., `dinov3-vitb16/model.safetensors`, `prototypes*.npy`, `.idea/`), remove them before pushing:
+
+```bash
+git rm --cached -r .idea dinov3-*
+git rm --cached prototypes*.npy
+```
+
+If you want to distribute weights, use Git LFS.
+
+---
+
+<!-- LEGACY README (SAM distillation) kept for reference:
 
 知识蒸馏SAM模型用于遥感图像分割，针对Potsdam数据集优化。
 
@@ -300,3 +373,4 @@ WARMUP_EPOCHS = 10
 **预计完成时间**：2个月（2025年12月底）
 
 **目标**：SCI低区 / EI会议
+-->

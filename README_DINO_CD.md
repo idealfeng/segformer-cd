@@ -1,4 +1,20 @@
-# DINO Change Detection Head（跨域 / Zero-shot）
+# DINOv3 Change Detection Head (DLV-CD)
+
+This file provides implementation-oriented notes for the DINOv3-based change-detection head.
+
+Key scripts:
+- `models/dinov2_head.py`: `DinoSiameseHead`
+- `dino_head_core.py`: dataloaders, training loop, evaluation, ensemble implementations
+- `train_dino_head.py`: training CLI
+- `eval_dino_head.py`: evaluation CLI (`--tta`, `--thr_mode`, `--ensemble_strategy`, corruptions, etc.)
+
+Strict zero-shot recommendation:
+- Use `--thr_mode fixed --thr 0.5` and pre-define inference settings (TTA / post-processing / ensemble).
+- Avoid `--thr_mode val_best` on the target domain.
+
+---
+
+<!-- LEGACY NOTES kept for reference:
 
 这个目录下的 `train_dino_head.py` / `eval_dino_head.py` 是一个“冻结 DINO 特征 + 轻量 CD Head”的变化检测方案，核心目标是跨域（例如 WHU↔LEVIR）在不使用目标域标签/图像（可选）的情况下保持较强泛化。
 
@@ -216,3 +232,4 @@ python eval_dino_head.py `
 建议先固定其它设置（阈值/平滑/minarea），只扫：
 - `--mem_alpha_max`：`0.15 / 0.25 / 0.35`
 - `--mem_update_conf`：`0.90 / 0.92 / 0.95`
+-->

@@ -1,61 +1,54 @@
-# ======================================================================
-#         SAM遥感蒸馏项目 - .gitignore (为你量身定做)
-# ======================================================================
+﻿# Open-source-friendly .gitignore (DLV-CD / DINOv3 change detection)
 
-# --- IDE和操作系统自动生成的文件 ---
-project/.idea/
-.vscode/
-*.DS_Store
+# --- OS / editors ---
+.DS_Store
 Thumbs.db
 
-# --- Python缓存和环境文件 ---
+.idea/
+.vscode/
+*.iml
+
+# --- Python ---
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .ipynb_checkpoints/
+
+# --- Environments ---
 .env
+.venv/
 venv/
 env/
 
-# --- 数据和模型文件 (核心部分！) ---
-# 忽略所有数据目录
-../data/Potsdam_processed/
-../data/teacher_outputs/
-../data/splits/
+# --- Build artifacts ---
+build/
+dist/
+*.egg-info/
 
-# 忽略所有原始数据集 (如果你会放在这里的话)
-Potsdam/
-
-# 忽略所有训练输出
-outputs/
-
-# 忽略所有数据资产
+# --- Data / outputs (do not publish) ---
 data/
+outputs/
 pretrained_weights/
+runs/
+wandb/
 
-# 忽略所有模型权重文件
-*.pth
+# --- Model weights / large artifacts (use Git LFS or download scripts) ---
 *.pt
+*.pth
 *.ckpt
 *.onnx
+*.safetensors
 
-# 忽略所有压缩包
-*.zip
-*.tar.gz
-*.rar
+# Local DINO backbone folders (often >100MB)
+dinov3-*/
+dinov3-vit*/
 
-# --- 日志和临时文件 ---
-*.log
-*.tmp
-*.temp
+# Prototypes / cached stats
+prototypes*.npy
 
-# ---模型文件---
-dinov3-vits16
-dinov3-vitl16
-dinov3-vith16plus
-
-# --- 那个一次性的脚本文件夹 ---
-# 如果你觉得这些脚本也是核心代码的一部分，可以把下面这行注释掉
-# 如果你觉得它们只是临时工具，就保留它
-数据预处理与教师网络输*/
+# Accidental legacy file created during README cleanup
+README_SAM_DISTILLATION_OLD.md
