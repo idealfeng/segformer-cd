@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 python eval_dino_head.py --checkpoint outputs/dino_head_cd/best.pt --data_root data/LEVIR-CD --out_dir outputs/eval --thr_mode fixed --smooth_k 3 --use_minarea --min_area 256 --vis --vis_n 10 --vis_dir outputs/eval/vis --full_eval
 """
@@ -5,6 +7,7 @@ python eval_dino_head.py --checkpoint outputs/dino_head_cd/best.pt --data_root d
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from dataclasses import asdict
 
@@ -160,6 +163,10 @@ def parse_args():
     parser.add_argument("--bc_contrast", type=float, default=0.0, help="Contrast delta: c ~ U(1-d,1+d)")
     parser.add_argument("--jpeg_quality", type=int, default=75, help="JPEG quality (1..95)")
     parser.add_argument("--print_every", type=int, default=0)
+    parser.add_argument("--profile_complexity", action="store_true", help="Add Params/FLOPs/latency/FPS to eval_results.json.")
+    parser.add_argument("--profile_size", type=int, default=256, help="Input crop size for complexity profiling.")
+    parser.add_argument("--profile_warmup", type=int, default=10, help="Warmup iterations for latency profiling.")
+    parser.add_argument("--profile_iters", type=int, default=30, help="Timed iterations for latency profiling.")
     parser.add_argument(
         "--window",
         type=int,
@@ -576,6 +583,108 @@ def score_heads_on_loader(
     return metrics
 
 
+@torch.no_grad()
+def profile_complexity(
+    model: torch.nn.Module,
+    device: str,
+    input_size: int,
+    warmup: int,
+    iters: int,
+    window: int | None,
+    stride: int | None,
+    use_ensemble: bool,
+    ensemble_cfg: dict | None,
+    tta_mode: str,
+) -> dict:
+    model.eval()
+    input_size = int(max(16, input_size))
+    warmup = int(max(0, warmup))
+    iters = int(max(1, iters))
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    img_a = torch.randn(1, 3, input_size, input_size, device=device)
+    img_b = torch.randn(1, 3, input_size, input_size, device=device)
+    prof_window = window
+    prof_stride = stride
+    if prof_window is not None and int(prof_window) >= input_size and prof_stride is not None:
+        prof_window = input_size
+        prof_stride = input_size
+
+    for _ in range(warmup):
+        _ = tta_inference_prob(
+            model=model,
+            img_a=img_a,
+            img_b=img_b,
+            device=device,
+            window=prof_window,
+            stride=prof_stride,
+            use_ensemble=use_ensemble,
+            ensemble_cfg=ensemble_cfg,
+            tta_mode=tta_mode,
+        )
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        _ = tta_inference_prob(
+            model=model,
+            img_a=img_a,
+            img_b=img_b,
+            device=device,
+            window=prof_window,
+            stride=prof_stride,
+            use_ensemble=use_ensemble,
+            ensemble_cfg=ensemble_cfg,
+            tta_mode=tta_mode,
+        )
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    latency_ms = (time.perf_counter() - t0) * 1000.0 / float(iters)
+
+    flops = None
+    flop_note = "torch.profiler with_flops=True; unsupported ops may be omitted."
+    try:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.startswith("cuda"):
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        with torch.profiler.profile(activities=activities, with_flops=True) as prof:
+            _ = tta_inference_prob(
+                model=model,
+                img_a=img_a,
+                img_b=img_b,
+                device=device,
+                window=prof_window,
+                stride=prof_stride,
+                use_ensemble=use_ensemble,
+                ensemble_cfg=ensemble_cfg,
+                tta_mode=tta_mode,
+            )
+        flops = int(sum(getattr(evt, "flops", 0) or 0 for evt in prof.key_averages()))
+    except Exception as e:
+        flop_note = f"FLOPs profiling failed: {e}"
+
+    return {
+        "params": int(total_params),
+        "params_m": float(total_params / 1e6),
+        "trainable_params": int(trainable_params),
+        "trainable_params_m": float(trainable_params / 1e6),
+        "flops": flops,
+        "flops_g": None if flops is None else float(flops / 1e9),
+        "latency_ms_per_pair": float(latency_ms),
+        "fps_pairs": float(1000.0 / latency_ms) if latency_ms > 0 else None,
+        "profile_input_size": int(input_size),
+        "profile_warmup": int(warmup),
+        "profile_iters": int(iters),
+        "profile_window": None if prof_window is None else int(prof_window),
+        "profile_stride": None if prof_stride is None else int(prof_stride),
+        "profile_tta": str(tta_mode),
+        "profile_use_ensemble": bool(use_ensemble),
+        "profile_ensemble_cfg": ensemble_cfg,
+        "note": flop_note,
+    }
+
+
 def main():
     args, cfg = parse_args()
     seed_everything(cfg.seed)
@@ -979,11 +1088,36 @@ def main():
     for k in ["precision", "recall", "f1", "iou", "oa", "kappa"]:
         print(f"{k}: {metrics[k]:.4f}")
     print(f"TP={metrics['TP']} FP={metrics['FP']} FN={metrics['FN']} TN={metrics['TN']}")
+    complexity = None
+    if args.profile_complexity:
+        print("\n====== Complexity ======")
+        complexity = profile_complexity(
+            model=model,
+            device=device,
+            input_size=int(args.profile_size),
+            warmup=int(args.profile_warmup),
+            iters=int(args.profile_iters),
+            window=args.window,
+            stride=args.stride,
+            use_ensemble=args.use_ensemble_pred,
+            ensemble_cfg=ensemble_cfg,
+            tta_mode=str(args.tta),
+        )
+        print(f"Params: {complexity['params_m']:.2f}M")
+        if complexity["flops_g"] is not None:
+            print(f"FLOPs: {complexity['flops_g']:.2f}G @ {complexity['profile_input_size']}x{complexity['profile_input_size']}")
+        else:
+            print("FLOPs: unavailable")
+        print(f"Latency: {complexity['latency_ms_per_pair']:.2f} ms/pair")
+        print(f"FPS: {complexity['fps_pairs']:.2f} pairs/s")
     out_dir = cfg.out_dir
     os.makedirs(out_dir, exist_ok=True)
     results_path = os.path.join(out_dir, "eval_results.json")
+    payload = {"split": "test", **metrics, "cfg": asdict(cfg)}
+    if complexity is not None:
+        payload["complexity"] = complexity
     with open(results_path, "w", encoding="utf-8") as f:
-        json.dump({"split": "test", **metrics, "cfg": asdict(cfg)}, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"Saved metrics to {results_path}")
     if args.vis:
         vis_dir = args.vis_dir or os.path.join(out_dir, "vis_eval")

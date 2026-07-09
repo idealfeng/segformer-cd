@@ -367,6 +367,19 @@ def _scatter_2d(ax, xy: np.ndarray, meta: List[PointMeta], *, title: str, color_
     ax.legend(loc="upper right", frameon=True, fontsize=8, markerscale=1.5)
 
 
+def _add_subfig_label(ax, label: str, *, y: float = -0.05, fontsize: int = 11):
+    """Add paper-style (a)/(b)/... label at the bottom-center of an axes."""
+    ax.text(
+        0.5,
+        float(y),
+        str(label),
+        transform=ax.transAxes,
+        ha="center",
+        va="top",
+        fontsize=int(fontsize),
+    )
+
+
 def parse_args():
     p = argparse.ArgumentParser("t-SNE/PCA visualization for a single checkpoint")
     # Preferred (paper) mode: pretrained DINOv3 encoder over multiple datasets (>=2).
@@ -597,6 +610,27 @@ def _run_pretrained(args):
         fig.tight_layout()
         fig.savefig(str(out_dir / "tsne.png"), bbox_inches="tight")
         plt.close(fig)
+
+        # Combined figure for paper (two subplots with (a)(b)).
+        fig, axes = plt.subplots(1, 2, figsize=(12.8, 5.2), dpi=200)
+        _scatter_by_dataset(
+            axes[0],
+            pca_xy,
+            meta,
+            title=f"PCA-2D (pretrained DINOv3 L{int(args.layer)}, patch-mean; which={args.which})",
+        )
+        _add_subfig_label(axes[0], "(a)")
+        _scatter_by_dataset(
+            axes[1],
+            tsne_xy,
+            meta,
+            title=f"t-SNE (PCA{int(args.pca_dim)}→2D; perplexity={float(args.tsne_perplexity):g})",
+        )
+        _add_subfig_label(axes[1], "(b)")
+        fig.tight_layout()
+        fig.savefig(str(out_dir / "pca_tsne.png"), bbox_inches="tight")
+        plt.close(fig)
+
         report["tsne"] = {
             "pca_dim": int(args.pca_dim),
             "perplexity": float(args.tsne_perplexity),
@@ -719,6 +753,29 @@ def main():
         fig.tight_layout()
         fig.savefig(str(out_dir / "tsne.png"), bbox_inches="tight")
         plt.close(fig)
+
+        # Combined figure for paper (two subplots with (a)(b)).
+        fig, axes = plt.subplots(1, 2, figsize=(12.8, 5.2), dpi=200)
+        _scatter_2d(
+            axes[0],
+            pca_xy,
+            meta,
+            title=f"PCA ({args.feature}, {args.which})",
+            color_by=str(args.color_by),
+        )
+        _add_subfig_label(axes[0], "(a)")
+        _scatter_2d(
+            axes[1],
+            tsne_xy,
+            meta,
+            title=f"t-SNE ({args.feature}, {args.which})",
+            color_by=str(args.color_by),
+        )
+        _add_subfig_label(axes[1], "(b)")
+        fig.tight_layout()
+        fig.savefig(str(out_dir / "pca_tsne.png"), bbox_inches="tight")
+        plt.close(fig)
+
         report["tsne"] = {
             "perplexity": float(args.tsne_perplexity),
             "iter": int(args.tsne_iter),

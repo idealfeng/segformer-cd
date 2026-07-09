@@ -35,6 +35,7 @@ outputs/
 pretrained_weights/
 runs/
 wandb/
+baselines/
 
 # --- Model weights / large artifacts (use Git LFS or download scripts) ---
 *.pt

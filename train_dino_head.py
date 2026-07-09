@@ -123,6 +123,10 @@ def parse_args():
     parser.add_argument("--grad_accum", type=int, default=base.grad_accum)
     parser.add_argument("--bce_weight", type=float, default=base.bce_weight)
     parser.add_argument("--dice_weight", type=float, default=base.dice_weight)
+    parser.add_argument("--tversky_weight", type=float, default=base.tversky_weight, help="FP/FN-asymmetric Tversky loss weight")
+    parser.add_argument("--tversky_alpha", type=float, default=base.tversky_alpha, help="Tversky FP penalty")
+    parser.add_argument("--tversky_beta", type=float, default=base.tversky_beta, help="Tversky FN penalty")
+    parser.add_argument("--fp_penalty_weight", type=float, default=base.fp_penalty_weight, help="Direct penalty on predicted probability over negative pixels")
     parser.add_argument("--boundary_weight", type=float, default=base.boundary_weight, help="aux boundary loss weight")
     parser.add_argument("--boundary_dilation", type=int, default=base.boundary_dilation, help="boundary thickness (px) for supervision")
     parser.add_argument("--lambda_consis", type=float, default=base.lambda_consis, help="counterfactual consistency weight")
@@ -201,6 +205,10 @@ def parse_args():
         grad_accum=args.grad_accum,
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,
+        tversky_weight=args.tversky_weight,
+        tversky_alpha=args.tversky_alpha,
+        tversky_beta=args.tversky_beta,
+        fp_penalty_weight=args.fp_penalty_weight,
         boundary_weight=args.boundary_weight,
         boundary_dilation=args.boundary_dilation,
         lambda_consis=args.lambda_consis,
@@ -353,7 +361,11 @@ def main():
     print(f"dataset sizes: train={len(train_loader.dataset)} val={len(val_loader.dataset)} test={len(test_loader.dataset)}")
     print(f"epochs={cfg.epochs} batch={cfg.batch_size} crop={cfg.crop_size} grad_accum={cfg.grad_accum}")
     print(f"dino={cfg.dino_name} fuse={cfg.fuse_mode} whiten={cfg.use_whiten}")
-    print(f"loss weights: bce={cfg.bce_weight} dice={cfg.dice_weight} boundary={cfg.boundary_weight} (dilation={cfg.boundary_dilation})")
+    print(
+        f"loss weights: bce={cfg.bce_weight} dice={cfg.dice_weight} "
+        f"tversky={cfg.tversky_weight}(a={cfg.tversky_alpha},b={cfg.tversky_beta}) "
+        f"fp_penalty={cfg.fp_penalty_weight} boundary={cfg.boundary_weight} (dilation={cfg.boundary_dilation})"
+    )
     print(f"eval: full_eval={cfg.full_eval} thr_mode={cfg.thr_mode} thr={cfg.thr} topk={cfg.topk} smooth_k={cfg.smooth_k}")
     print(f"minarea: {cfg.use_minarea} (min_area={cfg.min_area})")
     print("==========================\n")
@@ -370,6 +382,10 @@ def main():
             boundary_dilation=cfg.boundary_dilation,
             grad_accum=cfg.grad_accum,
             log_every=cfg.log_every,
+            tversky_w=cfg.tversky_weight,
+            tversky_alpha=cfg.tversky_alpha,
+            tversky_beta=cfg.tversky_beta,
+            fp_penalty_w=cfg.fp_penalty_weight,
             lambda_consis=cfg.lambda_consis,
             lambda_domain=cfg.lambda_domain,
             self_sup_weight=cfg.self_sup_weight,

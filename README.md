@@ -6,6 +6,7 @@ This repo contains training/evaluation code for a lightweight change-detection h
 - `train_dino_head.py`: train on a source dataset
 - `eval_dino_head.py`: evaluate in-domain / cross-domain
 - `tools/sweep_eval_zeroshot.py`: optional sweep helper for inference-time settings
+- `docs/TECHNICAL_GUIDE_ZH.md`: 中文技术文档（完整流程/评估协议/复现实验）
 
 ## Install
 

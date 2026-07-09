@@ -170,6 +170,22 @@ def dice_loss_with_logits(logits: torch.Tensor, target: torch.Tensor, eps: float
     return 1.0 - dice.mean()
 
 
+def tversky_loss_with_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.7,
+    beta: float = 0.3,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    prob = torch.sigmoid(logits)
+    target = target.float()
+    tp = (prob * target).sum(dim=(2, 3))
+    fp = (prob * (1.0 - target)).sum(dim=(2, 3))
+    fn = ((1.0 - prob) * target).sum(dim=(2, 3))
+    score = (tp + eps) / (tp + float(alpha) * fp + float(beta) * fn + eps)
+    return 1.0 - score.mean()
+
+
 def mask_to_boundary(mask: torch.Tensor, dilation: int = 3) -> torch.Tensor:
     """
     Extract binary boundary map from a 1/0 mask using Sobel gradients + dilation.
@@ -209,6 +225,10 @@ class HeadCfg:
     grad_accum: int = int(_cfg_value("GRADIENT_ACCUMULATION_STEPS", 2))
     bce_weight: float = float(_cfg_value("LOSS_WEIGHT_BCE", 1.0))
     dice_weight: float = float(_cfg_value("LOSS_WEIGHT_DICE", 1.0))
+    tversky_weight: float = 0.0
+    tversky_alpha: float = 0.7  # FP penalty; larger means more conservative predictions.
+    tversky_beta: float = 0.3
+    fp_penalty_weight: float = 0.0
     boundary_weight: float = 0.0
     boundary_dilation: int = 3
     lambda_consis: float = 0.0  # counterfactual consistency weight
@@ -861,6 +881,10 @@ def train_one_epoch(
     boundary_dilation: int,
     grad_accum: int,
     log_every: int,
+    tversky_w: float = 0.0,
+    tversky_alpha: float = 0.7,
+    tversky_beta: float = 0.3,
+    fp_penalty_w: float = 0.0,
     lambda_consis: float = 0.0,
     lambda_domain: float = 0.0,
     self_sup_weight: float = 0.0,
@@ -892,7 +916,9 @@ def train_one_epoch(
             prob = torch.sigmoid(logits)
             loss_bce = bce(logits, label)
             loss_dice = dice_loss_with_logits(logits, label)
-            loss = (bce_w * loss_bce + dice_w * loss_dice) / grad_accum
+            loss_tv = tversky_loss_with_logits(logits, label, alpha=tversky_alpha, beta=tversky_beta)
+            loss_fp = (prob * (1.0 - label)).mean()
+            loss = (bce_w * loss_bce + dice_w * loss_dice + tversky_w * loss_tv + fp_penalty_w * loss_fp) / grad_accum
             if boundary_w > 0 and isinstance(out, dict) and out.get("boundary") is not None:
                 b_logit = out["boundary"]
                 loss = loss + boundary_w * bce(b_logit, boundary_gt) / grad_accum
@@ -903,7 +929,20 @@ def train_one_epoch(
                     for k in range(logits_all.shape[0] - 1):
                         loss_bce_k = bce(logits_all[k], label)
                         loss_dice_k = dice_loss_with_logits(logits_all[k], label)
-                        head_loss = head_loss + (bce_w * loss_bce_k + dice_w * loss_dice_k)
+                        loss_tv_k = tversky_loss_with_logits(
+                            logits_all[k],
+                            label,
+                            alpha=tversky_alpha,
+                            beta=tversky_beta,
+                        )
+                        prob_k = torch.sigmoid(logits_all[k])
+                        loss_fp_k = (prob_k * (1.0 - label)).mean()
+                        head_loss = head_loss + (
+                            bce_w * loss_bce_k
+                            + dice_w * loss_dice_k
+                            + tversky_w * loss_tv_k
+                            + fp_penalty_w * loss_fp_k
+                        )
                     if head_aux_weight > 0:
                         loss = loss + head_aux_weight * head_loss / grad_accum
                     if head_cons_weight > 0:
@@ -923,7 +962,8 @@ def train_one_epoch(
                 if self_sup_weight > 0:
                     cf_bce = bce(logits_cf, label)
                     cf_dice = dice_loss_with_logits(logits_cf, label)
-                    loss = loss + self_sup_weight * (cf_bce + cf_dice) / grad_accum
+                    cf_tv = tversky_loss_with_logits(logits_cf, label, alpha=tversky_alpha, beta=tversky_beta)
+                    loss = loss + self_sup_weight * (cf_bce + cf_dice + tversky_w * cf_tv) / grad_accum
                 if boundary_w > 0 and isinstance(out_cf, dict) and out_cf.get("boundary") is not None:
                     loss = loss + boundary_w * bce(out_cf["boundary"], boundary_gt) / grad_accum
 
