@@ -9,6 +9,17 @@ baseline models and DLV-CD. Metrics are reported for the change class.
   with the same full-resolution 256x256 tile evaluator at threshold 0.5.
 - BIT is reproduced with an offline randomly initialized ResNet18 backbone because
   ImageNet weights were not available in the local environment.
+- SAM-CD-s is recorded separately as a fast low-budget FastSAM-s reproduction:
+  the original FastSAM-x encoder is replaced by FastSAM-s and trained for only
+  800 source steps. These numbers are diagnostic and should not be interpreted
+  as a fully converged official SAM-CD reproduction.
+- SAM-CD official uses the released `FastSAM.pt` encoder and source-validation
+  model selection. It is evaluated with the same fixed 0.5 threshold and no
+  target-domain training, fine-tuning, or threshold calibration.
+- ChangeCLIP is recorded as a repaired RN50 reproduction after fixing binary
+  mask loading for 0/1 labels and adding deterministic scene-text JSON sidecars.
+  Checkpoints are selected by source-validation results only; no target-domain
+  labels are used for model selection or threshold calibration.
 - DLV-CD rows are selected from current best local outputs per transfer direction.
   The threshold column is kept because several DLV-CD historical runs used fixed
   thresholds other than 0.5.
@@ -55,6 +66,24 @@ baseline models and DLV-CD. Metrics are reported for the change class.
 | BIT | S2Looking->WHU | 12.92 | 40.22 | 19.56 | 10.84 | @0.5 |
 | BIT | DSIFN->LEVIR | 14.48 | 28.22 | 19.14 | 10.58 | @0.5 |
 | BIT | DSIFN->WHU | 8.96 | 80.30 | 16.12 | 8.77 | @0.5 |
+| SAM-CD-s | LEVIR->WHU | 13.55 | 70.85 | 22.75 | 12.84 | FastSAM-s quick, 800 steps @0.5 |
+| SAM-CD-s | WHU->LEVIR | 32.40 | 18.02 | 23.16 | 13.10 | FastSAM-s quick, 800 steps @0.5 |
+| SAM-CD-s | S2Looking->LEVIR | 5.61 | 95.10 | 10.60 | 5.60 | FastSAM-s quick, 800 steps @0.5 |
+| SAM-CD-s | S2Looking->WHU | 5.62 | 99.40 | 10.63 | 5.61 | FastSAM-s quick, 800 steps @0.5 |
+| SAM-CD-s | DSIFN->LEVIR | 12.27 | 96.25 | 21.77 | 12.21 | FastSAM-s quick, 800 steps @0.5 |
+| SAM-CD-s | DSIFN->WHU | 6.75 | 99.56 | 12.64 | 6.75 | FastSAM-s quick, 800 steps @0.5 |
+| SAM-CD | LEVIR->WHU | 33.12 | 65.59 | 44.01 | 28.22 | official FastSAM.pt, source-tuned selected @0.5 |
+| SAM-CD | WHU->LEVIR | 35.46 | 9.53 | 15.03 | 8.12 | official FastSAM.pt, full source-val selected @0.5 |
+| SAM-CD | S2Looking->LEVIR | 19.00 | 18.72 | 18.86 | 10.41 | official FastSAM.pt, tuned source-val best @0.5 |
+| SAM-CD | S2Looking->WHU | 40.40 | 48.83 | 44.22 | 28.39 | official FastSAM.pt, source-tuned selected @0.5 |
+| SAM-CD | DSIFN->LEVIR | 26.19 | 64.48 | 37.25 | 22.89 | official FastSAM.pt, full source-val selected @0.5 |
+| SAM-CD | DSIFN->WHU | 8.92 | 83.42 | 16.12 | 8.77 | official FastSAM.pt, full source-val selected @0.5 |
+| ChangeCLIP | LEVIR->WHU | 21.37 | 61.15 | 31.67 | 18.81 | repaired RN50, source-val selected @0.5 |
+| ChangeCLIP | WHU->LEVIR | 27.56 | 16.49 | 20.63 | 11.50 | repaired RN50, source-val selected @0.5 |
+| ChangeCLIP | S2Looking->LEVIR | 2.67 | 17.00 | 4.62 | 2.37 | repaired RN50, source-val selected @0.5 |
+| ChangeCLIP | S2Looking->WHU | 3.36 | 2.32 | 2.74 | 1.39 | repaired RN50, source-val selected @0.5 |
+| ChangeCLIP | DSIFN->LEVIR | 20.15 | 37.22 | 26.14 | 15.04 | repaired RN50, source-val selected @0.5 |
+| ChangeCLIP | DSIFN->WHU | 11.00 | 66.21 | 18.86 | 10.41 | repaired RN50, source-val selected @0.5 |
 | DLV-CD | LEVIR->WHU | 87.07 | 58.43 | 69.93 | 53.77 | thr=0.5 |
 | DLV-CD | WHU->LEVIR | 71.78 | 72.76 | 72.27 | 56.58 | thr=0.5 |
 | DLV-CD | S2Looking->LEVIR | 63.61 | 78.18 | 70.15 | 54.02 | thr=0.5 |
@@ -72,6 +101,9 @@ baseline models and DLV-CD. Metrics are reported for the change class.
 | AANet | 20.81 | 25.06 | 15.93 | 15.19 | 16.02 | 24.86 | 19.65 |
 | SNUNet | 20.40 | 9.42 | 22.54 | 11.89 | 16.94 | 18.16 | 16.56 |
 | BIT | 18.63 | 16.35 | 19.56 | 12.15 | 16.12 | 19.14 | 16.99 |
+| SAM-CD-s | 22.75 | 23.16 | 10.63 | 10.60 | 12.64 | 21.77 | 16.93 |
+| SAM-CD | 44.01 | 15.03 | 44.22 | 18.86 | 16.12 | 37.25 | 29.25 |
+| ChangeCLIP | 31.67 | 20.63 | 2.74 | 4.62 | 18.86 | 26.14 | 17.44 |
 | DLV-CD | 69.93 | 72.27 | 66.05 | 70.15 | 61.63 | 52.22 | 65.38 |
 
 ## DLV-CD HEF / Layer Selection Ablation Draft (%)
@@ -129,6 +161,18 @@ Status rule used here: OK >= 60, Marginal = 50-60, Low < 50, Failed < 30.
 | BIT | WHU | 39.06 | 71.60 | 50.55 | 33.82 | WHU->LEVIR | Marginal |
 | BIT | S2Looking | 42.34 | 39.40 | 40.82 | 25.64 | S2Looking->WHU / S2Looking->LEVIR | Low |
 | BIT | DSIFN | 62.22 | 86.01 | 72.21 | 56.50 | DSIFN->WHU / DSIFN->LEVIR | OK |
+| SAM-CD-s | LEVIR | 39.12 | 87.55 | 54.08 | 37.06 | LEVIR->WHU | Marginal; FastSAM-s quick |
+| SAM-CD-s | WHU | 22.69 | 90.13 | 36.26 | 22.14 | WHU->LEVIR | Low; FastSAM-s quick |
+| SAM-CD-s | S2Looking | 8.67 | 72.11 | 15.48 | 8.39 | S2Looking->WHU / S2Looking->LEVIR | Failed; FastSAM-s quick |
+| SAM-CD-s | DSIFN | 41.04 | 98.41 | 57.92 | 40.77 | DSIFN->WHU / DSIFN->LEVIR | Marginal; FastSAM-s quick |
+| SAM-CD | LEVIR | 65.00 | 75.79 | 69.98 | 53.82 | LEVIR->WHU | Marginal/OK; official FastSAM.pt, best source-val after resume |
+| SAM-CD | WHU | 71.55 | 61.49 | 66.14 | 49.41 | WHU->LEVIR | OK; official FastSAM.pt, full-val selected after resume |
+| SAM-CD | S2Looking | 37.21 | 45.45 | 40.92 | 25.72 | S2Looking->WHU / S2Looking->LEVIR | Low; official FastSAM.pt, full-val evaluation |
+| SAM-CD | DSIFN | 67.92 | 69.57 | 68.74 | 52.37 | DSIFN->WHU / DSIFN->LEVIR | OK; official FastSAM.pt, full-val selected after conservative resume |
+| ChangeCLIP | LEVIR | 45.69 | 67.91 | 54.62 | 37.57 | LEVIR->WHU | Marginal; repaired RN50, best 3000 iter |
+| ChangeCLIP | WHU | 25.99 | 62.54 | 36.72 | 22.49 | WHU->LEVIR | Low; repaired RN50, cw5 best 4000 iter |
+| ChangeCLIP | S2Looking | 14.73 | 25.72 | 18.73 | 10.33 | S2Looking->WHU / S2Looking->LEVIR | Failed; repaired RN50, best 2000 iter |
+| ChangeCLIP | DSIFN | 74.77 | 44.42 | 55.73 | 38.63 | DSIFN->WHU / DSIFN->LEVIR | Marginal; repaired RN50, cw1 best 1000 iter |
 
 Practical interpretation: current S2Looking-source baseline results for BiFA,
 DMINet, ACABFNet, AANet, SNUNet, and BIT are all likely under-trained. SNUNet
@@ -158,6 +202,16 @@ result per direction when a retrained checkpoint is worse than the original.
 | AANet | WHU | 43.07 | WHU->LEVIR | 15.28 | 25.06 | use retest |
 | SNUNet | LEVIR | 48.90 | LEVIR->WHU | 20.40 | 12.73 | second-stage resume; keep original |
 | AANet | WHU | 55.18 | WHU->LEVIR | 15.28 | 24.31 | second-stage resume; first retest remains better |
+| SAM-CD | WHU | 66.14 | WHU->LEVIR | 8.53 | 15.03 | full source-val selected; use retest |
+| SAM-CD | WHU recall-biased | 48.59 | WHU->LEVIR | 15.03 | 28.24 | diagnostic only; last checkpoint, not source-val best |
+| SAM-CD | WHU continued | 61.04 | WHU->LEVIR | 28.24 | 19.98 | continued recall-biased training; worse than previous diagnostic |
+| SAM-CD | S2Looking last | 26.95 | S2Looking->LEVIR | 18.86 | 18.86 | same as best checkpoint |
+| SAM-CD | S2Looking AdamW last | 40.92 | S2Looking->LEVIR | 16.29 | 14.77 | worse than source-val best |
+| SAM-CD | DSIFN conservative | 68.74 | DSIFN->WHU | 14.21 | 16.12 | full source-val selected; use retest |
+| SAM-CD | DSIFN conservative | 68.74 | DSIFN->LEVIR | 33.37 | 37.25 | full source-val selected; use retest |
+| SAM-CD | DSIFN ultra-conservative | 19.67 | DSIFN->WHU | 16.12 | 36.98 | diagnostic only; last checkpoint, not source-val best |
+| ChangeCLIP | WHU cw10 | 34.54 | WHU->LEVIR | 20.63 | 23.12 | diagnostic only; worse source-val than cw5 |
+| ChangeCLIP | DSIFN cw10 | 49.02 | DSIFN->WHU / DSIFN->LEVIR | 18.86 / 26.14 | N/A | rejected: all-foreground source-val prediction |
 
 ## Model Complexity
 
@@ -181,3 +235,13 @@ result per direction when a retrained checkpoint is worse than the original.
 - DLV-CD DSIFN transfer: `outputs/task2_dsifn_source/*/eval_results.json`
 - DLV-CD fixed-threshold source-calibrated DSIFN transfer:
   `outputs/fixed05_traincal_2026-07-06/DSIFN2*_tv*_fp*_*/eval_results.json`
+- SAM-CD-s quick reproduction:
+  `outputs/samcd_quick_2026-08-10/*/eval_results.json`
+- SAM-CD official reproduction:
+  `outputs/samcd_official_2026-08-10/*/eval_results.json`
+- SAM-CD official tuned reproduction:
+  `outputs/samcd_official_tune_2026-08-10/*/eval_results.json`
+- SAM-CD official exploratory reproduction:
+  `outputs/samcd_official_explore_2026-08-11/*/eval_results.json`
+- ChangeCLIP repaired reproduction:
+  `outputs/changeclip_fixed_2026-08-11/*/eval_results.json`

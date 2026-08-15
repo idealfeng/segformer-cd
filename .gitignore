@@ -20,6 +20,7 @@ __pycache__/
 
 # --- Environments ---
 .env
+.home/
 .venv/
 venv/
 env/
