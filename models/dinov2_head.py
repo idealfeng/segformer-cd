@@ -201,12 +201,36 @@ class ChannelAttention(nn.Module):
 
 
 class DifferenceModule(nn.Module):
-    """|Fa-Fb| + (Fa+Fb) + channel attention."""
+    """Configurable symmetric feature comparison followed by channel attention."""
 
-    def __init__(self, in_channels: int, out_channels: int, norm: str = "gn"):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        norm: str = "gn",
+        fuse_mode: str = "abs+sum",
+        align_radius: int = 0,
+        align_temperature: float = 0.1,
+        learnable_align_blend: bool = False,
+    ):
         super().__init__()
+        if fuse_mode not in ("abs", "norm_abs", "abs+sum", "cat4"):
+            raise ValueError(f"Unknown fuse_mode: {fuse_mode}")
+        self.fuse_mode = fuse_mode
+        self.align_radius = int(max(0, align_radius))
+        self.align_temperature = float(max(1e-4, align_temperature))
+        self.learnable_align_blend = bool(learnable_align_blend and self.align_radius > 0)
+        self.align_strength = (
+            nn.Parameter(torch.zeros(())) if self.learnable_align_blend else None
+        )
+        fused_channels = {
+            "abs": in_channels,
+            "norm_abs": in_channels,
+            "abs+sum": in_channels * 2,
+            "cat4": in_channels * 4,
+        }[fuse_mode]
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels * 2, out_channels, 3, padding=1, bias=False),
+            nn.Conv2d(fused_channels, out_channels, 3, padding=1, bias=False),
             norm2d(norm, out_channels),
             nn.GELU(),
             nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
@@ -215,12 +239,63 @@ class DifferenceModule(nn.Module):
         )
         self.ca = ChannelAttention(out_channels)
 
-    def forward(self, feat_a: torch.Tensor, feat_b: torch.Tensor) -> torch.Tensor:
+    def _align(self, reference: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
+        if self.align_radius <= 0:
+            return candidate
+        radius = self.align_radius
+        kernel = 2 * radius + 1
+        bsz, channels, height, width = reference.shape
+        candidate_patches = F.unfold(candidate, kernel_size=kernel, padding=radius)
+        candidate_patches = candidate_patches.view(
+            bsz, channels, kernel * kernel, height, width
+        )
+        reference_norm = F.normalize(reference, dim=1)
+        candidate_norm = F.normalize(candidate_patches, dim=1)
+        correlation = (reference_norm.unsqueeze(2) * candidate_norm).sum(dim=1)
+
+        valid = F.unfold(
+            torch.ones((bsz, 1, height, width), device=reference.device, dtype=reference.dtype),
+            kernel_size=kernel,
+            padding=radius,
+        ).view(bsz, kernel * kernel, height, width)
+        correlation = correlation.masked_fill(valid < 0.5, torch.finfo(correlation.dtype).min)
+        weights = torch.softmax(correlation / self.align_temperature, dim=1)
+        return (candidate_patches * weights.unsqueeze(1)).sum(dim=2)
+
+    def _compare(self, feat_a: torch.Tensor, feat_b: torch.Tensor) -> torch.Tensor:
+        if self.fuse_mode == "norm_abs":
+            feat_a = F.normalize(feat_a, dim=1)
+            feat_b = F.normalize(feat_b, dim=1)
         diff = torch.abs(feat_a - feat_b)
-        semantic = feat_a + feat_b
-        out = torch.cat([diff, semantic], dim=1)
-        out = self.conv(out)
-        return self.ca(out)
+        if self.fuse_mode in ("abs", "norm_abs"):
+            out = diff
+        elif self.fuse_mode == "abs+sum":
+            out = torch.cat([diff, feat_a + feat_b], dim=1)
+        else:
+            # Four symmetric comparison terms; temporal order cannot change the result.
+            out = torch.cat([diff, feat_a + feat_b, feat_a * feat_b, torch.minimum(feat_a, feat_b)], dim=1)
+        return out
+
+    def forward(self, feat_a: torch.Tensor, feat_b: torch.Tensor, return_base: bool = False):
+        base_compare = self._compare(feat_a, feat_b)
+        if self.align_radius > 0:
+            aligned_b = self._align(feat_a, feat_b)
+            aligned_a = self._align(feat_b, feat_a)
+            aligned_compare = 0.5 * (
+                self._compare(feat_a, aligned_b) + self._compare(feat_b, aligned_a)
+            )
+            if self.align_strength is not None:
+                compare = base_compare + self.align_strength * (
+                    aligned_compare - base_compare
+                )
+            else:
+                compare = aligned_compare
+        else:
+            compare = base_compare
+        out = self.ca(self.conv(compare))
+        if return_base:
+            return out, base_compare, compare
+        return out
 
 
 class MultiScaleFusionDecoder(nn.Module):
@@ -422,6 +497,50 @@ class PrototypeChangeHead(nn.Module):
         return self.weight * proto_logit  # [B,1,H,W]
 
 
+class ResidualStyleAdapter(nn.Module):
+    """Zero-initialized photometric correction that starts as an exact identity."""
+
+    def __init__(self, channels: int, hidden: int = 64, scale: float = 1.0):
+        super().__init__()
+        hidden = int(max(8, hidden))
+        self.scale = float(scale)
+        self.norm = nn.InstanceNorm2d(channels, affine=False)
+        self.down = nn.Conv2d(channels, hidden, 1)
+        self.act = nn.GELU()
+        self.up = nn.Conv2d(hidden, channels, 1)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.scale * self.up(self.act(self.down(self.norm(x))))
+
+
+class SpatialHeadFusion(nn.Module):
+    """Locally gate selected layer probabilities, initialized as their exact mean."""
+
+    def __init__(self, head_count: int, hidden: int = 16):
+        super().__init__()
+        hidden = int(max(8, hidden))
+        self.gate = nn.Sequential(
+            nn.Conv2d(head_count + 2, hidden, 3, padding=1, bias=False),
+            nn.GroupNorm(1, hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, head_count, 1),
+        )
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+
+    def forward(self, logits: torch.Tensor):
+        probabilities = torch.sigmoid(logits)
+        mean = probabilities.mean(dim=1, keepdim=True)
+        std = probabilities.std(dim=1, keepdim=True, unbiased=False)
+        gate_input = torch.cat([probabilities, mean, std], dim=1)
+        weights = torch.softmax(self.gate(gate_input), dim=1)
+        probability = (weights * probabilities).sum(dim=1, keepdim=True)
+        probability = probability.clamp(1e-6, 1.0 - 1e-6)
+        return torch.logit(probability), weights
+
+
 class DinoSiameseHead(nn.Module):
     """
     DINOv2 / DINOv3 siamese head for change detection.
@@ -442,6 +561,9 @@ class DinoSiameseHead(nn.Module):
         head_depth: int = 3,
         dropout: float = 0.10,
         selected_layers: Tuple[int, ...] = (3, 6, 9, 12),
+        fuse_mode: str = "abs+sum",
+        align_radius: int = 0,
+        align_temperature: float = 0.1,
         adapter_dim: int = 192,
         norm: str = "gn",  # "gn" (recommended) or "bn"
         feat_smooth: bool = True,
@@ -456,12 +578,26 @@ class DinoSiameseHead(nn.Module):
         boundary_dim: int = 0,
         use_layer_ensemble: bool = False,
         layer_head_ch: int = 128,
+        use_nuisance_gate: bool = False,
+        nuisance_hidden: int = 64,
+        nuisance_gate_weight: float = 2.0,
+        nuisance_use_image_cues: bool = False,
+        use_residual_style_adapter: bool = False,
+        style_adapter_hidden: int = 64,
+        style_adapter_scale: float = 1.0,
+        learnable_align_blend: bool = False,
+        use_spatial_head_fusion: bool = False,
+        spatial_fusion_indices: Tuple[int, ...] = (2, 3, 4),
+        spatial_fusion_hidden: int = 16,
     ):
         super().__init__()
         self.patch = int(patch)
         self.use_whiten = bool(use_whiten)
         self.backbone_grad = bool(backbone_grad)
         self.selected_layers = list(selected_layers)
+        self.fuse_mode = str(fuse_mode)
+        self.align_radius = int(max(0, align_radius))
+        self.align_temperature = float(max(1e-4, align_temperature))
         self.adapter_dim = int(adapter_dim)
         self.norm = norm
         self.feat_smooth = bool(feat_smooth)
@@ -475,6 +611,13 @@ class DinoSiameseHead(nn.Module):
         self.boundary_dim = int(boundary_dim)
         self.use_layer_ensemble = bool(use_layer_ensemble)
         self.layer_head_ch = int(layer_head_ch)
+        self.use_nuisance_gate = bool(use_nuisance_gate)
+        self.nuisance_gate_weight = float(max(0.0, nuisance_gate_weight))
+        self.nuisance_use_image_cues = bool(nuisance_use_image_cues)
+        self.use_residual_style_adapter = bool(use_residual_style_adapter)
+        self.learnable_align_blend = bool(learnable_align_blend)
+        self.use_spatial_head_fusion = bool(use_spatial_head_fusion)
+        self.spatial_fusion_indices = tuple(int(x) for x in spatial_fusion_indices)
 
         self.use_hf = "dinov3" in dino_name.lower() or dino_name.startswith(
             "facebook/dinov3"
@@ -514,10 +657,43 @@ class DinoSiameseHead(nn.Module):
 
         self.diff_modules = nn.ModuleList(
             [
-                DifferenceModule(self.adapter_dim, self.adapter_dim, norm=self.norm)
+                DifferenceModule(
+                    self.adapter_dim,
+                    self.adapter_dim,
+                    norm=self.norm,
+                    fuse_mode=self.fuse_mode,
+                    align_radius=self.align_radius,
+                    align_temperature=self.align_temperature,
+                    learnable_align_blend=self.learnable_align_blend,
+                )
                 for _ in self.selected_layers
             ]
         )
+        self.style_adapters = None
+        if self.use_residual_style_adapter:
+            self.style_adapters = nn.ModuleList(
+                [
+                    ResidualStyleAdapter(
+                        self.adapter_dim,
+                        hidden=style_adapter_hidden,
+                        scale=style_adapter_scale,
+                    )
+                    for _ in self.selected_layers
+                ]
+            )
+
+        self.nuisance_head = None
+        if self.use_nuisance_gate:
+            nuisance_in = self.adapter_dim * len(self.selected_layers)
+            if self.nuisance_use_image_cues:
+                nuisance_in += 3
+            nuisance_hidden = int(max(8, nuisance_hidden))
+            self.nuisance_head = nn.Sequential(
+                nn.Conv2d(nuisance_in, nuisance_hidden, 1, bias=False),
+                norm2d(self.norm, nuisance_hidden),
+                nn.GELU(),
+                nn.Conv2d(nuisance_hidden, 1, 1),
+            )
 
         self.decoder = MultiScaleFusionDecoder(
             in_channels_list=[self.adapter_dim] * len(self.selected_layers),
@@ -560,6 +736,23 @@ class DinoSiameseHead(nn.Module):
             )
             self.fused_classifier = nn.Conv2d(self.layer_head_ch, 1, 1)
 
+        self.spatial_head_fusion = None
+        if self.use_spatial_head_fusion:
+            if not self.use_layer_ensemble:
+                raise ValueError("Spatial head fusion requires use_layer_ensemble=True")
+            total_heads = len(self.selected_layers) + 1
+            if not self.spatial_fusion_indices or any(
+                index < 0 or index >= total_heads
+                for index in self.spatial_fusion_indices
+            ):
+                raise ValueError(
+                    f"Invalid spatial_fusion_indices={self.spatial_fusion_indices} "
+                    f"for {total_heads} heads"
+                )
+            self.spatial_head_fusion = SpatialHeadFusion(
+                len(self.spatial_fusion_indices), hidden=spatial_fusion_hidden
+            )
+
         self.boundary_head = None
         self.boundary_refine = None
         if self.boundary_dim > 0:
@@ -582,6 +775,38 @@ class DinoSiameseHead(nn.Module):
             except Exception as e:
                 print(f"Failed to load prototypes from {proto_path}: {e}")
                 self.proto_head = None
+
+    @staticmethod
+    def _nuisance_image_cues(
+        img_a: torch.Tensor,
+        img_b: torch.Tensor,
+        out_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        mean = img_a.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = img_a.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        a = (img_a * std + mean).clamp(0, 1)
+        b = (img_b * std + mean).clamp(0, 1)
+        rgb_diff = torch.abs(a - b).mean(dim=1, keepdim=True)
+
+        kernel = 15
+        mu_a = F.avg_pool2d(a, kernel, stride=1, padding=kernel // 2)
+        mu_b = F.avg_pool2d(b, kernel, stride=1, padding=kernel // 2)
+        var_a = F.avg_pool2d((a - mu_a).square(), kernel, stride=1, padding=kernel // 2)
+        var_b = F.avg_pool2d((b - mu_b).square(), kernel, stride=1, padding=kernel // 2)
+        local_a = (a - mu_a) / torch.sqrt(var_a + 1e-4)
+        local_b = (b - mu_b) / torch.sqrt(var_b + 1e-4)
+        local_diff = torch.abs(local_a - local_b).mean(dim=1, keepdim=True)
+
+        def _gradient_magnitude(x: torch.Tensor) -> torch.Tensor:
+            dx = F.pad(x[..., :, 1:] - x[..., :, :-1], (0, 1, 0, 0))
+            dy = F.pad(x[..., 1:, :] - x[..., :-1, :], (0, 0, 0, 1))
+            return torch.sqrt(dx.square() + dy.square() + 1e-6)
+
+        edge_diff = torch.abs(_gradient_magnitude(a) - _gradient_magnitude(b)).mean(
+            dim=1, keepdim=True
+        )
+        cues = torch.cat([rgb_diff, local_diff, edge_diff], dim=1)
+        return F.interpolate(cues, size=out_size, mode="area")
 
     def _smooth_feat(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -696,18 +921,27 @@ class DinoSiameseHead(nn.Module):
         fa_list, fb_list, (Hp, Wp), (H0, W0) = self._extract_pair_features(img_a, img_b)
 
         diff_feats = []
+        pair_features = []
+        base_pair_features = []
+        alignment_features = []
         logits_list = []
         deep_fa = None
         deep_fb = None
         for i, (fa, fb, dm) in enumerate(zip(fa_list, fb_list, self.diff_modules)):
-            fa = self.adapters[i](fa)
-            fb = self.adapters[i](fb)
-            fa = self._smooth_feat(fa)
-            fb = self._smooth_feat(fb)
+            fa_base = self._smooth_feat(self.adapters[i](fa))
+            fb_base = self._smooth_feat(self.adapters[i](fb))
+            base_pair_features.append((fa_base, fb_base))
+            if self.style_adapters is not None:
+                fa = self.style_adapters[i](fa_base)
+                fb = self.style_adapters[i](fb_base)
+            else:
+                fa, fb = fa_base, fb_base
+            pair_features.append((fa, fb))
             if i == len(self.diff_modules) - 1:
                 deep_fa = fa
                 deep_fb = fb
-            diff = dm(fa, fb)
+            diff, base_compare, blended_compare = dm(fa, fb, return_base=True)
+            alignment_features.append((base_compare, blended_compare))
             diff_feats.append(diff)
             if self.layer_heads is not None:
                 logits_list.append(self.layer_heads[i](diff, out_size=(H, W)))
@@ -783,6 +1017,19 @@ class DinoSiameseHead(nn.Module):
             logits_all = torch.stack(logits_list + [fused_logit], dim=0)
             pred_logit = fused_logit
 
+        fusion_weights = None
+        if self.spatial_head_fusion is not None:
+            selected = logits_all.index_select(
+                0,
+                torch.as_tensor(
+                    self.spatial_fusion_indices,
+                    device=logits_all.device,
+                    dtype=torch.long,
+                ),
+            )
+            selected = selected.squeeze(2).permute(1, 0, 2, 3)
+            pred_logit, fusion_weights = self.spatial_head_fusion(selected)
+
         boundary_up = None
         if boundary_logit is not None:
             boundary_up = F.interpolate(
@@ -794,13 +1041,36 @@ class DinoSiameseHead(nn.Module):
                     boundary_up, size=(H, W), mode="bilinear", align_corners=False
                 )
 
+        raw_pred_logit = pred_logit
+        nuisance_up = None
+        if self.nuisance_head is not None:
+            # Detaching preserves the source-trained change representation while
+            # the auxiliary gate learns synthetic appearance/registration nuisances.
+            nuisance_feat = torch.cat([feat.detach() for feat in diff_feats], dim=1)
+            if self.nuisance_use_image_cues:
+                image_cues = self._nuisance_image_cues(
+                    img_a, img_b, out_size=nuisance_feat.shape[-2:]
+                )
+                nuisance_feat = torch.cat([nuisance_feat, image_cues], dim=1)
+            nuisance_logit = self.nuisance_head(nuisance_feat)
+            nuisance_up = F.interpolate(
+                nuisance_logit, size=(H, W), mode="bilinear", align_corners=False
+            )
+            pred_logit = raw_pred_logit - self.nuisance_gate_weight * torch.sigmoid(nuisance_up)
+
         return {
             "pred": pred_logit,
+            "raw_pred": raw_pred_logit,
+            "nuisance_logit": nuisance_up,
             "feat": refined,
             "domain_logit": domain_logit,
             "proto_logit": proto_logit,
             "boundary": boundary_up,
             "logits_all": logits_all,
+            "pair_features": pair_features,
+            "base_pair_features": base_pair_features,
+            "alignment_features": alignment_features,
+            "fusion_weights": fusion_weights,
         }
 
 

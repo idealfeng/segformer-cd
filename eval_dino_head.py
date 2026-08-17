@@ -39,11 +39,66 @@ except Exception:
     _DEFAULT_WINDOW = 256
 
 
+class ProbabilityCheckpointEnsemble(torch.nn.Module):
+    """Average checkpoint probabilities while preserving the model output API."""
+
+    def __init__(self, models, weights=None):
+        super().__init__()
+        if len(models) < 2:
+            raise ValueError("ProbabilityCheckpointEnsemble requires at least two models")
+        self.models = torch.nn.ModuleList(models)
+        if weights is None:
+            weights = [1.0 / len(models)] * len(models)
+        if len(weights) != len(models) or any(float(w) < 0 for w in weights):
+            raise ValueError("Model ensemble weights must be non-negative and match model count")
+        weight_sum = sum(float(w) for w in weights)
+        if weight_sum <= 0:
+            raise ValueError("Model ensemble weights must have a positive sum")
+        self.register_buffer(
+            "weights",
+            torch.tensor([float(w) / weight_sum for w in weights], dtype=torch.float32),
+        )
+
+    def _mean_prob_logit(self, logits):
+        prob_stack = torch.stack([torch.sigmoid(x) for x in logits], dim=0)
+        shape = (len(logits),) + (1,) * (prob_stack.ndim - 1)
+        probs = (prob_stack * self.weights.to(prob_stack).view(shape)).sum(dim=0)
+        return torch.logit(probs.clamp(1e-6, 1.0 - 1e-6))
+
+    def forward(self, img_a, img_b):
+        outputs = [model(img_a, img_b) for model in self.models]
+        result = dict(outputs[0])
+        result["pred"] = self._mean_prob_logit([out["pred"] for out in outputs])
+
+        logits_all = [out.get("logits_all") for out in outputs]
+        if all(x is not None for x in logits_all):
+            shapes = {tuple(x.shape) for x in logits_all}
+            if len(shapes) != 1:
+                raise RuntimeError(f"Checkpoint ensemble logits_all shapes differ: {sorted(shapes)}")
+            result["logits_all"] = self._mean_prob_logit(logits_all)
+        else:
+            result["logits_all"] = None
+        return result
+
+
 def parse_args():
     base = HeadCfg()
     beta_default = getattr(base, "beta_prior", 0.01)
     parser = argparse.ArgumentParser(description="Evaluate DINOv2 change-detection head")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint (best.pt/last.pt)")
+    parser.add_argument(
+        "--model_ensemble_checkpoints",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Additional checkpoints to fuse in probability space; heterogeneous fuse modes are supported.",
+    )
+    parser.add_argument(
+        "--model_ensemble_weights",
+        type=str,
+        default=None,
+        help="Comma-separated probability weights for primary plus additional checkpoints.",
+    )
     parser.add_argument("--data_root", type=str, default=base.data_root)
     parser.add_argument(
         "--calib_root",
@@ -89,7 +144,7 @@ def parse_args():
         "--ensemble_strategy",
         type=str,
         default="mean_prob",
-        choices=["mean_prob", "mean_logit", "topk", "weighted_logit", "cvx_nll", "ugls", "consis2", "consisk", "uwi"],
+        choices=["mean_prob", "mean_logit", "min_prob", "soft_min", "max_rejection", "topk", "weighted_logit", "cvx_nll", "ugls", "consis2", "consisk", "uwi"],
         help="Ensemble strategy when --use_ensemble_pred is set",
     )
     parser.add_argument(
@@ -97,6 +152,12 @@ def parse_args():
         type=str,
         default=None,
         help="Optional comma-separated head indices to use (e.g., '3,4'). Overrides topk selection.",
+    )
+    parser.add_argument(
+        "--consensus_strength",
+        type=float,
+        default=0.5,
+        help="For soft_min/max_rejection: conservative fusion strength in [0,1].",
     )
     parser.add_argument(
         "--ensemble_topk",
@@ -148,7 +209,13 @@ def parse_args():
     parser.add_argument("--vis", action="store_true", help="Save visualization samples")
     parser.add_argument("--vis_n", type=int, default=base.vis_n)
     parser.add_argument("--vis_dir", type=str, default=None)
-    parser.add_argument("--tta", type=str, default="none", choices=["none", "flip", "d4"], help="Test-time augmentation")
+    parser.add_argument(
+        "--tta",
+        type=str,
+        default="none",
+        choices=["none", "pair_contrast", "flip", "flip_median", "flip_min", "d4"],
+        help="Test-time augmentation and probability consensus mode.",
+    )
     parser.add_argument(
         "--corrupt",
         type=str,
@@ -163,6 +230,19 @@ def parse_args():
     parser.add_argument("--bc_contrast", type=float, default=0.0, help="Contrast delta: c ~ U(1-d,1+d)")
     parser.add_argument("--jpeg_quality", type=int, default=75, help="JPEG quality (1..95)")
     parser.add_argument("--print_every", type=int, default=0)
+    parser.add_argument(
+        "--strict_zeroshot",
+        action="store_true",
+        help=(
+            "Do not construct or use the target validation split. Requires a distinct "
+            "--calib_root and rejects target-label visualizations."
+        ),
+    )
+    parser.add_argument(
+        "--exploratory_target_tuned",
+        action="store_true",
+        help="Record that target labels were inspected to select inference hyperparameters.",
+    )
     parser.add_argument("--profile_complexity", action="store_true", help="Add Params/FLOPs/latency/FPS to eval_results.json.")
     parser.add_argument("--profile_size", type=int, default=256, help="Input crop size for complexity profiling.")
     parser.add_argument("--profile_warmup", type=int, default=10, help="Warmup iterations for latency profiling.")
@@ -201,6 +281,16 @@ def parse_args():
     args.data_root = _normalize_data_root(args.data_root, "--data_root")
     args.calib_root = _normalize_data_root(args.calib_root, "--calib_root")
 
+    if args.strict_zeroshot:
+        if not args.calib_root:
+            raise ValueError("--strict_zeroshot requires a source-domain --calib_root")
+        target_root = Path(args.data_root).resolve()
+        calib_root = Path(args.calib_root).resolve()
+        if target_root == calib_root:
+            raise ValueError("--strict_zeroshot requires --calib_root to differ from --data_root")
+        if args.vis:
+            raise ValueError("--strict_zeroshot rejects --vis because it renders target labels")
+
     if args.ensemble_indices:
         try:
             args.ensemble_indices = [int(x) for x in str(args.ensemble_indices).split(",") if str(x).strip() != ""]
@@ -234,6 +324,64 @@ def parse_args():
     if args.stride is not None and args.stride <= 0:
         args.stride = None
     return args, cfg
+
+
+def _build_model_from_checkpoint_cfg(load_cfg: dict, cfg: HeadCfg, device: str):
+    arch = load_cfg.get("arch", getattr(cfg, "arch", "dlv"))
+    if arch == "a0":
+        if DinoFrozenA0Head is None:
+            raise ImportError(
+                "DinoFrozenA0Head is not available. Please update models/dinov2_head.py "
+                "or evaluate a non-A0 checkpoint."
+            )
+        return DinoFrozenA0Head(
+            dino_name=load_cfg.get("dino_name", cfg.dino_name),
+            layer=load_cfg.get("a0_layer", cfg.a0_layer),
+            use_whiten=load_cfg.get("use_whiten", cfg.use_whiten),
+        ).to(device)
+
+    selected_layers = tuple(
+        int(x) for x in load_cfg.get("selected_layers", cfg.selected_layers)
+    )
+    return DinoSiameseHead(
+        dino_name=load_cfg.get("dino_name", cfg.dino_name),
+        selected_layers=selected_layers,
+        fuse_mode=load_cfg.get("fuse_mode", cfg.fuse_mode),
+        align_radius=load_cfg.get("align_radius", cfg.align_radius),
+        align_temperature=load_cfg.get("align_temperature", cfg.align_temperature),
+        learnable_align_blend=load_cfg.get(
+            "learnable_align_blend", cfg.learnable_align_blend
+        ),
+        use_whiten=load_cfg.get("use_whiten", cfg.use_whiten),
+        use_domain_adv=load_cfg.get("use_domain_adv", cfg.use_domain_adv),
+        domain_hidden=load_cfg.get("domain_hidden", cfg.domain_hidden),
+        domain_grl=load_cfg.get("domain_grl", cfg.domain_grl),
+        use_style_norm=load_cfg.get("use_style_norm", cfg.use_style_norm),
+        proto_path=load_cfg.get("proto_path", cfg.proto_path),
+        proto_weight=load_cfg.get("proto_weight", cfg.proto_weight),
+        boundary_dim=load_cfg.get("boundary_dim", cfg.boundary_dim),
+        use_layer_ensemble=load_cfg.get("use_layer_ensemble", cfg.use_layer_ensemble),
+        layer_head_ch=load_cfg.get("layer_head_ch", cfg.layer_head_ch),
+        use_nuisance_gate=load_cfg.get("use_nuisance_gate", cfg.use_nuisance_gate),
+        nuisance_hidden=load_cfg.get("nuisance_hidden", cfg.nuisance_hidden),
+        nuisance_gate_weight=load_cfg.get("nuisance_gate_weight", cfg.nuisance_gate_weight),
+        nuisance_use_image_cues=load_cfg.get("nuisance_use_image_cues", cfg.nuisance_use_image_cues),
+        use_residual_style_adapter=load_cfg.get(
+            "use_residual_style_adapter", cfg.use_residual_style_adapter
+        ),
+        style_adapter_hidden=load_cfg.get("style_adapter_hidden", cfg.style_adapter_hidden),
+        style_adapter_scale=load_cfg.get("style_adapter_scale", cfg.style_adapter_scale),
+        use_spatial_head_fusion=load_cfg.get(
+            "use_spatial_head_fusion", cfg.use_spatial_head_fusion
+        ),
+        spatial_fusion_indices=tuple(
+            int(x)
+            for x in load_cfg.get("spatial_fusion_indices", cfg.spatial_fusion_indices)
+        ),
+        spatial_fusion_hidden=load_cfg.get(
+            "spatial_fusion_hidden", cfg.spatial_fusion_hidden
+        ),
+    ).to(device)
 
 
 def _project_simplex(v: torch.Tensor) -> torch.Tensor:
@@ -696,8 +844,13 @@ def main():
     cfg.batch_size = args.batch_size
     cfg.num_workers = int(getattr(args, "num_workers", cfg.num_workers))
     # eval loaders: use --data_root
-    _, val_loader, test_loader = build_dataloaders(cfg, require_train=False, require_val=False)
-    if val_loader is None:
+    _, val_loader, test_loader = build_dataloaders(
+        cfg,
+        require_train=False,
+        require_val=False,
+        load_val=not args.strict_zeroshot,
+    )
+    if val_loader is None and not args.strict_zeroshot:
         print("[Data] No val split found; using test split as val for calibration/visualization.")
         val_loader = test_loader
     # calibration loaders: optionally use --calib_root (e.g., source domain)
@@ -720,12 +873,20 @@ def main():
         )
         cfg_calib.batch_size = cfg.batch_size
         try:
-            _, val_loader_calib, test_loader_calib = build_dataloaders(cfg_calib, require_train=False, require_val=False)
+            _, val_loader_calib, test_loader_calib = build_dataloaders(
+                cfg_calib,
+                require_train=False,
+                require_val=args.strict_zeroshot,
+            )
             if val_loader_calib is None:
                 val_loader_calib = test_loader_calib
                 print("[Calib] No val split found under calib_root; using test split for calibration.")
             print(f"[Calib] Using calib_root={args.calib_root} (val size={len(val_loader_calib.dataset)})")
         except Exception as e:
+            if args.strict_zeroshot:
+                raise RuntimeError(
+                    f"Strict zero-shot calibration loader failed for {args.calib_root}: {e}"
+                ) from e
             print(f"[Calib] Failed to build calib loaders from {args.calib_root}: {e}; fallback to --data_root val.")
             val_loader_calib = val_loader
     ckpt = torch.load(args.checkpoint, map_location=device)
@@ -733,41 +894,69 @@ def main():
     if isinstance(load_cfg, dict):
         cfg.arch = load_cfg.get("arch", getattr(cfg, "arch", "dlv"))
         cfg.a0_layer = load_cfg.get("a0_layer", getattr(cfg, "a0_layer", 12))
+        cfg.fuse_mode = load_cfg.get("fuse_mode", cfg.fuse_mode)
+        cfg.align_radius = load_cfg.get("align_radius", cfg.align_radius)
+        cfg.align_temperature = load_cfg.get("align_temperature", cfg.align_temperature)
+        cfg.learnable_align_blend = load_cfg.get(
+            "learnable_align_blend", cfg.learnable_align_blend
+        )
+        cfg.use_nuisance_gate = load_cfg.get("use_nuisance_gate", cfg.use_nuisance_gate)
+        cfg.nuisance_hidden = load_cfg.get("nuisance_hidden", cfg.nuisance_hidden)
+        cfg.nuisance_gate_weight = load_cfg.get("nuisance_gate_weight", cfg.nuisance_gate_weight)
+        cfg.nuisance_use_image_cues = load_cfg.get("nuisance_use_image_cues", cfg.nuisance_use_image_cues)
+        cfg.use_residual_style_adapter = load_cfg.get(
+            "use_residual_style_adapter", cfg.use_residual_style_adapter
+        )
+        cfg.style_adapter_hidden = load_cfg.get(
+            "style_adapter_hidden", cfg.style_adapter_hidden
+        )
+        cfg.style_adapter_scale = load_cfg.get(
+            "style_adapter_scale", cfg.style_adapter_scale
+        )
         cfg.use_layer_ensemble = load_cfg.get("use_layer_ensemble", cfg.use_layer_ensemble)
         cfg.layer_head_ch = load_cfg.get("layer_head_ch", cfg.layer_head_ch)
+        cfg.use_spatial_head_fusion = load_cfg.get(
+            "use_spatial_head_fusion", cfg.use_spatial_head_fusion
+        )
+        cfg.spatial_fusion_hidden = load_cfg.get(
+            "spatial_fusion_hidden", cfg.spatial_fusion_hidden
+        )
+        if load_cfg.get("spatial_fusion_indices") is not None:
+            cfg.spatial_fusion_indices = tuple(
+                int(x) for x in load_cfg["spatial_fusion_indices"]
+            )
         if load_cfg.get("selected_layers") is not None:
             cfg.selected_layers = tuple(int(x) for x in load_cfg["selected_layers"])
 
-    arch = load_cfg.get("arch", getattr(cfg, "arch", "dlv")) if isinstance(load_cfg, dict) else "dlv"
-    if arch == "a0":
-        if DinoFrozenA0Head is None:
-            raise ImportError(
-                "DinoFrozenA0Head is not available. Please update models/dinov2_head.py to a version that defines DinoFrozenA0Head, "
-                "or evaluate a non-A0 checkpoint."
-            )
-        model = DinoFrozenA0Head(
-            dino_name=load_cfg.get("dino_name", cfg.dino_name) if isinstance(load_cfg, dict) else cfg.dino_name,
-            layer=load_cfg.get("a0_layer", cfg.a0_layer) if isinstance(load_cfg, dict) else cfg.a0_layer,
-            use_whiten=load_cfg.get("use_whiten", cfg.use_whiten) if isinstance(load_cfg, dict) else cfg.use_whiten,
-        ).to(device)
-    else:
-        model = DinoSiameseHead(
-            dino_name=load_cfg.get("dino_name", cfg.dino_name) if isinstance(load_cfg, dict) else cfg.dino_name,
-            selected_layers=cfg.selected_layers,
-            use_whiten=load_cfg.get("use_whiten", cfg.use_whiten) if isinstance(load_cfg, dict) else cfg.use_whiten,
-            use_domain_adv=load_cfg.get("use_domain_adv", cfg.use_domain_adv) if isinstance(load_cfg, dict) else cfg.use_domain_adv,
-            domain_hidden=load_cfg.get("domain_hidden", cfg.domain_hidden) if isinstance(load_cfg, dict) else cfg.domain_hidden,
-            domain_grl=load_cfg.get("domain_grl", cfg.domain_grl) if isinstance(load_cfg, dict) else cfg.domain_grl,
-            use_style_norm=load_cfg.get("use_style_norm", cfg.use_style_norm) if isinstance(load_cfg, dict) else cfg.use_style_norm,
-            proto_path=load_cfg.get("proto_path", cfg.proto_path) if isinstance(load_cfg, dict) else cfg.proto_path,
-            proto_weight=load_cfg.get("proto_weight", cfg.proto_weight) if isinstance(load_cfg, dict) else cfg.proto_weight,
-            boundary_dim=load_cfg.get("boundary_dim", cfg.boundary_dim) if isinstance(load_cfg, dict) else cfg.boundary_dim,
-            use_layer_ensemble=load_cfg.get("use_layer_ensemble", cfg.use_layer_ensemble) if isinstance(load_cfg, dict) else cfg.use_layer_ensemble,
-            layer_head_ch=load_cfg.get("layer_head_ch", cfg.layer_head_ch) if isinstance(load_cfg, dict) else cfg.layer_head_ch,
-        ).to(device)
+    load_cfg = load_cfg if isinstance(load_cfg, dict) else {}
+    model = _build_model_from_checkpoint_cfg(load_cfg, cfg, device)
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
     print(f"Loaded checkpoint from {args.checkpoint}")
-    print(f"val/test sizes: {len(val_loader.dataset)}/{len(test_loader.dataset)}")
+    model_checkpoint_paths = [args.checkpoint]
+    model_ensemble_weights = None
+    if args.model_ensemble_checkpoints:
+        models = [model]
+        for checkpoint_path in args.model_ensemble_checkpoints:
+            extra_ckpt = torch.load(checkpoint_path, map_location=device)
+            extra_cfg = extra_ckpt.get("cfg") if isinstance(extra_ckpt, dict) else None
+            extra_cfg = extra_cfg if isinstance(extra_cfg, dict) else {}
+            extra_model = _build_model_from_checkpoint_cfg(extra_cfg, cfg, device)
+            extra_model.load_state_dict(extra_ckpt["model"] if "model" in extra_ckpt else extra_ckpt)
+            models.append(extra_model)
+            model_checkpoint_paths.append(checkpoint_path)
+            print(f"Loaded ensemble checkpoint from {checkpoint_path}")
+        if args.model_ensemble_weights:
+            model_ensemble_weights = [
+                float(x) for x in args.model_ensemble_weights.split(",") if x.strip()
+            ]
+        model = ProbabilityCheckpointEnsemble(models, weights=model_ensemble_weights).to(device)
+        model_ensemble_weights = model.weights.detach().cpu().tolist()
+        print(
+            f"[Model Ensemble] Probability fusion over {len(models)} checkpoints "
+            f"with weights={model_ensemble_weights}"
+        )
+    val_size = "not loaded" if val_loader is None else str(len(val_loader.dataset))
+    print(f"val/test sizes: {val_size}/{len(test_loader.dataset)}")
 
     # Convenience: allow passing transformer layer numbers in --ensemble_indices.
     # If any provided index is >= K (K = len(selected_layers)+1), treat them as layer numbers.
@@ -792,8 +981,12 @@ def main():
 
     ensemble_cfg = None
     if args.use_ensemble_pred:
-        if args.ensemble_strategy in ("mean_prob", "mean_logit"):
+        if args.ensemble_strategy in ("mean_prob", "mean_logit", "min_prob", "soft_min", "max_rejection"):
             ensemble_cfg = {"mode": args.ensemble_strategy}
+            if args.ensemble_strategy in ("soft_min", "max_rejection"):
+                if not 0.0 <= float(args.consensus_strength) <= 1.0:
+                    raise ValueError("--consensus_strength must be in [0,1]")
+                ensemble_cfg["strength"] = float(args.consensus_strength)
             if args.ensemble_indices is not None:
                 ensemble_cfg["indices"] = args.ensemble_indices
                 print(f"[Ensemble] Using fixed heads indices={args.ensemble_indices} with mode={args.ensemble_strategy}")
@@ -899,7 +1092,7 @@ def main():
                 print("[Ensemble] use_layer_ensemble=False; cannot score heads for topk/weighted/cvx/ugls strategies. Disabling ensemble.")
                 args.use_ensemble_pred = False
 
-    if args.use_ensemble_pred and ensemble_cfg is None and args.ensemble_strategy not in ("mean_prob", "mean_logit"):
+    if args.use_ensemble_pred and ensemble_cfg is None and args.ensemble_strategy not in ("mean_prob", "mean_logit", "min_prob", "soft_min"):
             print("\n[Ensemble] Scoring each head on VAL to derive selection/weights...")
             score_thr_mode = cfg.thr_mode
             score_thr = cfg.thr
@@ -1113,7 +1306,28 @@ def main():
     out_dir = cfg.out_dir
     os.makedirs(out_dir, exist_ok=True)
     results_path = os.path.join(out_dir, "eval_results.json")
-    payload = {"split": "test", **metrics, "cfg": asdict(cfg)}
+    payload = {
+        "split": "test",
+        **metrics,
+        "cfg": asdict(cfg),
+        "protocol": {
+            "strict_zeroshot": bool(args.strict_zeroshot),
+            "exploratory_target_tuned": bool(args.exploratory_target_tuned),
+            "uses_target_labels_for_fusion_selection": bool(
+                args.exploratory_target_tuned
+            ),
+            "calib_root": args.calib_root,
+            "target_val_loaded": val_loader is not None,
+            "ensemble_cfg": ensemble_cfg,
+            "model_ensemble_checkpoints": model_checkpoint_paths,
+            "model_ensemble_weights": model_ensemble_weights,
+            "checkpoint_test_time_adapted": bool(load_cfg.get("test_time_adapted", False)),
+            "checkpoint_test_time_adapt_method": load_cfg.get("test_time_adapt_method"),
+            "checkpoint_test_time_adapt_uses_target_labels": load_cfg.get(
+                "test_time_adapt_uses_target_labels"
+            ),
+        },
+    }
     if complexity is not None:
         payload["complexity"] = complexity
     with open(results_path, "w", encoding="utf-8") as f:

@@ -72,6 +72,65 @@ def style_perturb(x: torch.Tensor, sigma: float = 0.15, blur_prob: float = 0.3) 
     return x.clamp(-3, 3)
 
 
+def nuisance_perturb(
+    x: torch.Tensor,
+    illumination_strength: float = 0.35,
+    max_shift: float = 2.0,
+    blur_prob: float = 0.3,
+) -> torch.Tensor:
+    """Target-like no-change perturbation with smooth illumination and mild misregistration."""
+    x01 = _denorm_imagenet(x).clamp(0.0, 1.0)
+    bsz, channels, height, width = x01.shape
+
+    gamma = torch.empty((bsz, 1, 1, 1), device=x.device, dtype=x.dtype).uniform_(0.7, 1.4)
+    x01 = x01.clamp_min(1e-4).pow(gamma)
+    gain = torch.empty((bsz, channels, 1, 1), device=x.device, dtype=x.dtype).uniform_(0.8, 1.2)
+    bias = torch.empty((bsz, channels, 1, 1), device=x.device, dtype=x.dtype).uniform_(-0.08, 0.08)
+    x01 = x01 * gain + bias
+
+    field = torch.randn((bsz, channels, 4, 4), device=x.device, dtype=x.dtype)
+    field = F.interpolate(field, size=(height, width), mode="bicubic", align_corners=False)
+    field = field / field.std(dim=(2, 3), keepdim=True).clamp_min(1e-4)
+    x01 = x01 * (1.0 + float(illumination_strength) * field).clamp(0.5, 1.5)
+
+    if blur_prob > 0 and torch.rand((), device=x.device).item() < blur_prob:
+        x01 = F.avg_pool2d(x01, kernel_size=3, stride=1, padding=1)
+
+    if max_shift > 0:
+        shift_x = torch.empty((bsz,), device=x.device, dtype=x.dtype).uniform_(-max_shift, max_shift)
+        shift_y = torch.empty((bsz,), device=x.device, dtype=x.dtype).uniform_(-max_shift, max_shift)
+        theta = torch.zeros((bsz, 2, 3), device=x.device, dtype=x.dtype)
+        theta[:, 0, 0] = 1.0
+        theta[:, 1, 1] = 1.0
+        theta[:, 0, 2] = 2.0 * shift_x / max(1, width - 1)
+        theta[:, 1, 2] = 2.0 * shift_y / max(1, height - 1)
+        grid = F.affine_grid(theta, x01.shape, align_corners=False)
+        x01 = F.grid_sample(x01, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    return _norm_imagenet(x01.clamp(0.0, 1.0))
+
+
+def registration_perturb(x: torch.Tensor, max_shift: float = 2.0) -> torch.Tensor:
+    """Apply only a mild subpixel translation, preserving image appearance."""
+    if max_shift <= 0:
+        return x
+    bsz, _, height, width = x.shape
+    shift_x = torch.empty((bsz,), device=x.device, dtype=x.dtype).uniform_(
+        -max_shift, max_shift
+    )
+    shift_y = torch.empty((bsz,), device=x.device, dtype=x.dtype).uniform_(
+        -max_shift, max_shift
+    )
+    theta = torch.zeros((bsz, 2, 3), device=x.device, dtype=x.dtype)
+    theta[:, 0, 0] = 1.0
+    theta[:, 1, 1] = 1.0
+    theta[:, 0, 2] = 2.0 * shift_x / max(1, width - 1)
+    theta[:, 1, 2] = 2.0 * shift_y / max(1, height - 1)
+    grid = F.affine_grid(theta, x.shape, align_corners=False)
+    return F.grid_sample(
+        x, grid, mode="bilinear", padding_mode="border", align_corners=False
+    )
+
+
 def confusion_update(pred: torch.Tensor, gt: torch.Tensor, cm: Dict[str, int]):
     pred = pred.view(-1).to(torch.int64)
     gt = gt.view(-1).to(torch.int64)
@@ -186,6 +245,102 @@ def tversky_loss_with_logits(
     return 1.0 - score.mean()
 
 
+def _symmetric_local_cosine(
+    feat_a: torch.Tensor,
+    feat_b: torch.Tensor,
+    radius: int = 0,
+) -> torch.Tensor:
+    """Best local cosine correspondence, averaged in both temporal directions."""
+    feat_a = F.normalize(feat_a, dim=1)
+    feat_b = F.normalize(feat_b, dim=1)
+    radius = int(max(0, radius))
+    if radius == 0:
+        return (feat_a * feat_b).sum(dim=1, keepdim=True)
+
+    bsz, channels, height, width = feat_a.shape
+    kernel = 2 * radius + 1
+
+    def _best(reference: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
+        patches = F.unfold(candidate, kernel_size=kernel, padding=radius)
+        patches = patches.view(bsz, channels, kernel * kernel, height, width)
+        corr = (reference.unsqueeze(2) * patches).sum(dim=1)
+
+        valid = F.unfold(
+            torch.ones((bsz, 1, height, width), device=reference.device, dtype=reference.dtype),
+            kernel_size=kernel,
+            padding=radius,
+        ).view(bsz, kernel * kernel, height, width)
+        corr = corr.masked_fill(valid < 0.5, torch.finfo(corr.dtype).min)
+        return corr.amax(dim=1, keepdim=True)
+
+    return 0.5 * (_best(feat_a, feat_b) + _best(feat_b, feat_a))
+
+
+def temporal_dense_contrastive_loss(
+    pair_features,
+    target: torch.Tensor,
+    margin: float = 0.2,
+    radius: int = 1,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Pull unchanged temporal features together and push changed features apart."""
+    if not pair_features:
+        return target.new_zeros(())
+
+    losses = []
+    for feat_a, feat_b in pair_features:
+        similarity = _symmetric_local_cosine(feat_a, feat_b, radius=radius)
+        changed = F.interpolate(target.float(), size=similarity.shape[-2:], mode="area").clamp(0, 1)
+        unchanged = 1.0 - changed
+
+        pull = ((1.0 - similarity) * unchanged).sum() / unchanged.sum().clamp_min(eps)
+        push = (F.relu(similarity - float(margin)) * changed).sum() / changed.sum().clamp_min(eps)
+        losses.append(pull + push)
+    return torch.stack(losses).mean()
+
+
+def pair_feature_invariance_loss(clean_pair_features, augmented_pair_features) -> torch.Tensor:
+    """Align augmented adapter features to detached clean-view anchors."""
+    if len(clean_pair_features) != len(augmented_pair_features):
+        raise ValueError("Clean and augmented pair features must have the same layer count")
+    losses = []
+    for clean_pair, augmented_pair in zip(clean_pair_features, augmented_pair_features):
+        for clean_feat, augmented_feat in zip(clean_pair, augmented_pair):
+            clean_anchor = F.normalize(clean_feat.detach(), dim=1)
+            augmented_norm = F.normalize(augmented_feat, dim=1)
+            losses.append(1.0 - (clean_anchor * augmented_norm).sum(dim=1).mean())
+    if not losses:
+        raise ValueError("Pair feature lists must not be empty")
+    return torch.stack(losses).mean()
+
+
+def pair_feature_preservation_loss(base_pair_features, adapted_pair_features) -> torch.Tensor:
+    """Penalize residual drift on clean inputs relative to a frozen base path."""
+    if len(base_pair_features) != len(adapted_pair_features):
+        raise ValueError("Base and adapted pair features must have the same layer count")
+    losses = []
+    for base_pair, adapted_pair in zip(base_pair_features, adapted_pair_features):
+        for base_feat, adapted_feat in zip(base_pair, adapted_pair):
+            anchor = base_feat.detach()
+            scale = anchor.square().mean().clamp_min(1e-6)
+            losses.append((adapted_feat - anchor).square().mean() / scale)
+    if not losses:
+        raise ValueError("Pair feature lists must not be empty")
+    return torch.stack(losses).mean()
+
+
+def alignment_feature_preservation_loss(alignment_features) -> torch.Tensor:
+    """Keep local-alignment blending close to the frozen comparison path on clean pairs."""
+    losses = []
+    for base_compare, blended_compare in alignment_features:
+        anchor = base_compare.detach()
+        scale = anchor.square().mean().clamp_min(1e-6)
+        losses.append((blended_compare - anchor).square().mean() / scale)
+    if not losses:
+        raise ValueError("Alignment feature list must not be empty")
+    return torch.stack(losses).mean()
+
+
 def mask_to_boundary(mask: torch.Tensor, dilation: int = 3) -> torch.Tensor:
     """
     Extract binary boundary map from a 1/0 mask using Sobel gradients + dilation.
@@ -229,6 +384,8 @@ class HeadCfg:
     tversky_alpha: float = 0.7  # FP penalty; larger means more conservative predictions.
     tversky_beta: float = 0.3
     fp_penalty_weight: float = 0.0
+    hard_negative_weight: float = 0.0
+    hard_negative_ratio: float = 0.1
     boundary_weight: float = 0.0
     boundary_dilation: int = 3
     lambda_consis: float = 0.0  # counterfactual consistency weight
@@ -237,6 +394,26 @@ class HeadCfg:
     style_aug_prob: float = 0.0
     style_aug_sigma: float = 0.2
     style_blur_prob: float = 0.3
+    identity_neg_weight: float = 0.0
+    identity_neg_prob: float = 0.0
+    contrastive_weight: float = 0.0
+    contrastive_margin: float = 0.2
+    contrastive_radius: int = 1
+    nuisance_real_weight: float = 0.0
+    nuisance_synth_weight: float = 0.0
+    nuisance_synth_prob: float = 0.0
+    nuisance_illumination: float = 0.35
+    nuisance_max_shift: float = 2.0
+    nuisance_pair_aug_weight: float = 0.0
+    nuisance_pair_aug_prob: float = 0.0
+    nuisance_pair_consistency: float = 0.0
+    nuisance_feature_consistency: float = 0.0
+    nuisance_clean_feature_preservation: float = 0.0
+    registration_neg_weight: float = 0.0
+    registration_neg_prob: float = 0.0
+    registration_max_shift: float = 2.0
+    alignment_clean_preservation: float = 0.0
+    spatial_fusion_uniform_weight: float = 0.0
     head_aux_weight: float = 0.25
     head_cons_weight: float = 0.0
 
@@ -260,6 +437,8 @@ class HeadCfg:
     # For 32-layer ViT (e.g., vith16plus): (8, 16, 24, 32)
     selected_layers: Tuple[int, ...] = (3, 6, 9, 12)
     fuse_mode: str = "abs+sum"
+    align_radius: int = 0
+    align_temperature: float = 0.1
     use_whiten: bool = False
     use_domain_adv: bool = False
     domain_hidden: int = 256
@@ -270,6 +449,22 @@ class HeadCfg:
     boundary_dim: int = 0
     use_layer_ensemble: bool = False
     layer_head_ch: int = 128
+    use_nuisance_gate: bool = False
+    nuisance_hidden: int = 64
+    nuisance_gate_weight: float = 2.0
+    nuisance_use_image_cues: bool = False
+    train_nuisance_only: bool = False
+    train_adapters_only: bool = False
+    use_residual_style_adapter: bool = False
+    style_adapter_hidden: int = 64
+    style_adapter_scale: float = 1.0
+    train_style_adapter_only: bool = False
+    learnable_align_blend: bool = False
+    train_alignment_only: bool = False
+    use_spatial_head_fusion: bool = False
+    spatial_fusion_indices: Tuple[int, ...] = (2, 3, 4)
+    spatial_fusion_hidden: int = 16
+    train_spatial_fusion_only: bool = False
     a0_layer: int = 12  # only used when arch == "a0"
     ft_mode: str = "frozen"  # frozen | shallow | deep | full (backbone fine-tuning)
     ft_k: int = 4  # number of blocks to unfreeze for shallow/deep
@@ -278,6 +473,8 @@ class HeadCfg:
     # saving / logging
     save_best: bool = True
     save_last: bool = True
+    selection_metric: str = "f1"  # f1 | fbeta | precision
+    selection_beta: float = 1.0  # beta < 1 favors precision when using fbeta
     vis_every: int = 5
     vis_n: int = 8
     log_every: int = 50
@@ -333,6 +530,20 @@ def _ensemble_prob_from_logits_all(
         return torch.sigmoid(logits_all).mean(dim=0)
     if mode == "mean_logit":
         return torch.sigmoid(logits_all.mean(dim=0))
+    if mode == "min_prob":
+        # Conservative consensus: every selected head must clear the threshold.
+        return torch.sigmoid(logits_all).amin(dim=0)
+    if mode == "soft_min":
+        # Fixed-strength compromise between average fusion and strict consensus.
+        probs = torch.sigmoid(logits_all)
+        strength = max(0.0, min(1.0, float(cfg.get("strength", 0.5))))
+        return (1.0 - strength) * probs.mean(dim=0) + strength * probs.amin(dim=0)
+    if mode == "max_rejection":
+        # Suppress a locally over-confident head while preserving consensus pixels.
+        probs = torch.sigmoid(logits_all)
+        strength = max(0.0, min(1.0, float(cfg.get("strength", 0.5))))
+        mean = probs.mean(dim=0)
+        return (mean - strength * (probs.amax(dim=0) - mean)).clamp_(0.0, 1.0)
     if mode == "weighted_logit":
         if weights is None:
             raise ValueError("ensemble_cfg.mode='weighted_logit' requires ensemble_cfg['weights']")
@@ -502,6 +713,26 @@ def _norm_imagenet(x: torch.Tensor) -> torch.Tensor:
     return (x - mean) / std
 
 
+def pairwise_contrast_canonicalize(
+    img_a: torch.Tensor,
+    img_b: torch.Tensor,
+    eps: float = 1e-4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Remove global temporal brightness/contrast mismatch using shared pair moments."""
+    a01 = _denorm_imagenet(img_a).clamp(0.0, 1.0)
+    b01 = _denorm_imagenet(img_b).clamp(0.0, 1.0)
+    mu_a = a01.mean(dim=(2, 3), keepdim=True)
+    mu_b = b01.mean(dim=(2, 3), keepdim=True)
+    std_a = a01.std(dim=(2, 3), keepdim=True).clamp_min(eps)
+    std_b = b01.std(dim=(2, 3), keepdim=True).clamp_min(eps)
+
+    shared_mu = 0.5 * (mu_a + mu_b)
+    shared_std = torch.sqrt(0.5 * (std_a.square() + std_b.square())).clamp_min(eps)
+    a_shared = ((a01 - mu_a) / std_a * shared_std + shared_mu).clamp(0.0, 1.0)
+    b_shared = ((b01 - mu_b) / std_b * shared_std + shared_mu).clamp(0.0, 1.0)
+    return _norm_imagenet(a_shared), _norm_imagenet(b_shared)
+
+
 def _jpeg_compress_batch(x01: torch.Tensor, quality: int) -> torch.Tensor:
     """
     x01: [B,3,H,W] in [0,1] (float). Returns float in [0,1].
@@ -662,12 +893,18 @@ def tta_inference_prob(
 
     tta_mode:
       - "none": no augmentation
+      - "pair_contrast": shared pairwise brightness/contrast canonicalization
       - "flip": 4-way (id, hflip, vflip, hvflip)
+      - "flip_median": 4-way flip TTA merged by the conservative lower median
+      - "flip_min": 4-way flip TTA merged by per-pixel minimum probability
       - "d4":   8-way D4 (rot0/90/180/270, each with optional hflip)
 
     Merges by averaging probabilities (after inverting each transform back).
     """
     tta_mode = str(tta_mode or "none").lower()
+    if tta_mode == "pair_contrast":
+        img_a, img_b = pairwise_contrast_canonicalize(img_a, img_b)
+        tta_mode = "none"
     if tta_mode in ("none", "off", "0", "false"):
         if window is not None and stride is not None:
             return sliding_window_inference(
@@ -683,15 +920,20 @@ def tta_inference_prob(
         out = model(img_a, img_b)
         return _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
 
-    if tta_mode == "flip":
+    merge_mode = "mean"
+    if tta_mode in ("flip", "flip_median", "flip_min"):
         # id/hflip/rot180/vflip (equivalent set of 4 flip variants)
         aug_list = [(0, False), (0, True), (2, False), (2, True)]
+        if tta_mode == "flip_median":
+            merge_mode = "median"
+        elif tta_mode == "flip_min":
+            merge_mode = "min"
     elif tta_mode in ("d4", "rot90", "flip_rot90"):
         aug_list = [(k, f) for k in (0, 1, 2, 3) for f in (False, True)]
     else:
         raise ValueError(f"Unknown tta_mode: {tta_mode}")
 
-    prob_sum = None
+    probs = []
     for k, f in aug_list:
         a_aug = _apply_tta_d4(img_a, k=k, hflip=f)
         b_aug = _apply_tta_d4(img_b, k=k, hflip=f)
@@ -710,9 +952,15 @@ def tta_inference_prob(
             out = model(a_aug, b_aug)
             prob_aug = _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
         prob_aug = _invert_tta_d4(prob_aug, k=k, hflip=f)
-        prob_sum = prob_aug if prob_sum is None else (prob_sum + prob_aug)
+        probs.append(prob_aug)
 
-    return prob_sum / float(len(aug_list))
+    prob_stack = torch.stack(probs, dim=0)
+    if merge_mode == "min":
+        return prob_stack.amin(dim=0)
+    if merge_mode == "median":
+        # torch.median returns the lower middle value for an even number of views.
+        return prob_stack.median(dim=0).values
+    return prob_stack.mean(dim=0)
 
 
 @torch.no_grad()
@@ -731,6 +979,23 @@ def sliding_window_inference(
     Returns prob map (1,1,H,W) on device.
     """
     _, _, H, W = img_a.shape
+    if use_ensemble and str((ensemble_cfg or {}).get("mode")) == "max_rejection":
+        probs_all = sliding_window_inference_probs_all(
+            model=model,
+            img_a=img_a,
+            img_b=img_b,
+            window=window,
+            stride=stride,
+            device=device,
+        )
+        cfg = ensemble_cfg or {}
+        indices = cfg.get("indices")
+        if indices is not None:
+            index = torch.as_tensor(indices, device=probs_all.device, dtype=torch.long)
+            probs_all = probs_all.index_select(0, index)
+        strength = max(0.0, min(1.0, float(cfg.get("strength", 0.5))))
+        mean = probs_all.mean(dim=0)
+        return (mean - strength * (probs_all.amax(dim=0) - mean)).clamp_(0.0, 1.0)
     if H <= window and W <= window:
         out = model(img_a, img_b)
         return _prob_from_out(out, use_ensemble=use_ensemble, ensemble_cfg=ensemble_cfg)
@@ -885,12 +1150,34 @@ def train_one_epoch(
     tversky_alpha: float = 0.7,
     tversky_beta: float = 0.3,
     fp_penalty_w: float = 0.0,
+    hard_negative_weight: float = 0.0,
+    hard_negative_ratio: float = 0.1,
     lambda_consis: float = 0.0,
     lambda_domain: float = 0.0,
     self_sup_weight: float = 0.0,
     style_aug_prob: float = 0.0,
     style_aug_sigma: float = 0.2,
     style_blur_prob: float = 0.3,
+    identity_neg_weight: float = 0.0,
+    identity_neg_prob: float = 0.0,
+    contrastive_weight: float = 0.0,
+    contrastive_margin: float = 0.2,
+    contrastive_radius: int = 1,
+    nuisance_real_weight: float = 0.0,
+    nuisance_synth_weight: float = 0.0,
+    nuisance_synth_prob: float = 0.0,
+    nuisance_illumination: float = 0.35,
+    nuisance_max_shift: float = 2.0,
+    nuisance_pair_aug_weight: float = 0.0,
+    nuisance_pair_aug_prob: float = 0.0,
+    nuisance_pair_consistency: float = 0.0,
+    nuisance_feature_consistency: float = 0.0,
+    nuisance_clean_feature_preservation: float = 0.0,
+    registration_neg_weight: float = 0.0,
+    registration_neg_prob: float = 0.0,
+    registration_max_shift: float = 2.0,
+    alignment_clean_preservation: float = 0.0,
+    spatial_fusion_uniform_weight: float = 0.0,
     head_aux_weight: float = 0.0,
     head_cons_weight: float = 0.0,
 ):
@@ -919,6 +1206,66 @@ def train_one_epoch(
             loss_tv = tversky_loss_with_logits(logits, label, alpha=tversky_alpha, beta=tversky_beta)
             loss_fp = (prob * (1.0 - label)).mean()
             loss = (bce_w * loss_bce + dice_w * loss_dice + tversky_w * loss_tv + fp_penalty_w * loss_fp) / grad_accum
+            if hard_negative_weight > 0:
+                negative_loss = F.softplus(logits)[label < 0.5]
+                if negative_loss.numel() > 0:
+                    k = max(1, int(math.ceil(float(hard_negative_ratio) * negative_loss.numel())))
+                    k = min(k, negative_loss.numel())
+                    hard_negative_loss = torch.topk(negative_loss, k=k, sorted=False).values.mean()
+                    loss = loss + hard_negative_weight * hard_negative_loss / grad_accum
+            if contrastive_weight > 0 and isinstance(out, dict) and out.get("pair_features"):
+                loss_contrast = temporal_dense_contrastive_loss(
+                    out["pair_features"],
+                    label,
+                    margin=contrastive_margin,
+                    radius=contrastive_radius,
+                )
+                loss = loss + contrastive_weight * loss_contrast / grad_accum
+            if alignment_clean_preservation > 0:
+                if not isinstance(out, dict) or not out.get("alignment_features"):
+                    raise ValueError(
+                        "alignment_clean_preservation requires alignment_features"
+                    )
+                alignment_preservation = alignment_feature_preservation_loss(
+                    out["alignment_features"]
+                )
+                loss = loss + (
+                    alignment_clean_preservation
+                    * alignment_preservation
+                    / grad_accum
+                )
+            if spatial_fusion_uniform_weight > 0:
+                fusion_weights = out.get("fusion_weights") if isinstance(out, dict) else None
+                if fusion_weights is None:
+                    raise ValueError(
+                        "spatial_fusion_uniform_weight requires fusion_weights"
+                    )
+                uniform = 1.0 / float(fusion_weights.shape[1])
+                fusion_regularization = (fusion_weights - uniform).square().mean()
+                loss = loss + (
+                    spatial_fusion_uniform_weight
+                    * fusion_regularization
+                    / grad_accum
+                )
+            if nuisance_real_weight > 0 and isinstance(out, dict) and out.get("nuisance_logit") is not None:
+                with torch.no_grad():
+                    raw_pred = out.get("raw_pred", logits)
+                    nuisance_target = (
+                        (torch.sigmoid(raw_pred) > 0.5) & (label < 0.5)
+                    ).to(dtype=out["nuisance_logit"].dtype)
+                nuisance_loss_map = F.binary_cross_entropy_with_logits(
+                    out["nuisance_logit"], nuisance_target, reduction="none"
+                )
+                positive = nuisance_target > 0.5
+                negative = ~positive
+                positive_loss = (
+                    nuisance_loss_map[positive].mean()
+                    if positive.any()
+                    else nuisance_loss_map.new_zeros(())
+                )
+                negative_loss = nuisance_loss_map[negative].mean()
+                nuisance_real_loss = 0.5 * (positive_loss + negative_loss)
+                loss = loss + nuisance_real_weight * nuisance_real_loss / grad_accum
             if boundary_w > 0 and isinstance(out, dict) and out.get("boundary") is not None:
                 b_logit = out["boundary"]
                 loss = loss + boundary_w * bce(b_logit, boundary_gt) / grad_accum
@@ -984,10 +1331,192 @@ def train_one_epoch(
                         dom_labels = torch.cat(dom_labels_list, dim=0)
                         dom_loss = F.binary_cross_entropy_with_logits(dom_logits, dom_labels)
                         loss = loss + lambda_domain * dom_loss / grad_accum
+
+            do_nuisance_pair_aug = (
+                (
+                    nuisance_pair_aug_weight > 0
+                    or nuisance_pair_consistency > 0
+                    or nuisance_feature_consistency > 0
+                    or nuisance_clean_feature_preservation > 0
+                )
+                and nuisance_pair_aug_prob > 0
+                and torch.rand((), device=img_a.device).item() < nuisance_pair_aug_prob
+            )
+            if do_nuisance_pair_aug:
+                # Independent photometric changes preserve the source label; geometric
+                # shifts are intentionally disabled because they invalidate its boundary.
+                img_a_aug = nuisance_perturb(
+                    img_a,
+                    illumination_strength=nuisance_illumination,
+                    max_shift=0.0,
+                    blur_prob=style_blur_prob,
+                )
+                img_b_aug = nuisance_perturb(
+                    img_b,
+                    illumination_strength=nuisance_illumination,
+                    max_shift=0.0,
+                    blur_prob=style_blur_prob,
+                )
+                out_aug = model(img_a_aug, img_b_aug)
+                logits_aug = out_aug["pred"] if isinstance(out_aug, dict) else out_aug
+                prob_aug = torch.sigmoid(logits_aug)
+                aug_loss = (
+                    bce_w * bce(logits_aug, label)
+                    + dice_w * dice_loss_with_logits(logits_aug, label)
+                    + tversky_w
+                    * tversky_loss_with_logits(
+                        logits_aug,
+                        label,
+                        alpha=tversky_alpha,
+                        beta=tversky_beta,
+                    )
+                    + fp_penalty_w * (prob_aug * (1.0 - label)).mean()
+                )
+                if isinstance(out_aug, dict) and out_aug.get("logits_all") is not None:
+                    logits_all_aug = out_aug["logits_all"]
+                    if logits_all_aug.ndim == 5 and logits_all_aug.shape[0] > 1:
+                        aux_aug = logits_aug.new_zeros(())
+                        for k in range(logits_all_aug.shape[0] - 1):
+                            logits_k = logits_all_aug[k]
+                            prob_k = torch.sigmoid(logits_k)
+                            aux_aug = aux_aug + (
+                                bce_w * bce(logits_k, label)
+                                + dice_w * dice_loss_with_logits(logits_k, label)
+                                + tversky_w
+                                * tversky_loss_with_logits(
+                                    logits_k,
+                                    label,
+                                    alpha=tversky_alpha,
+                                    beta=tversky_beta,
+                                )
+                                + fp_penalty_w * (prob_k * (1.0 - label)).mean()
+                            )
+                        aug_loss = aug_loss + head_aux_weight * aux_aug
+                if nuisance_pair_aug_weight > 0:
+                    loss = loss + nuisance_pair_aug_weight * aug_loss / grad_accum
+                if nuisance_pair_consistency > 0:
+                    loss = loss + (
+                        nuisance_pair_consistency
+                        * F.l1_loss(prob_aug, prob.detach())
+                        / grad_accum
+                    )
+                if nuisance_feature_consistency > 0:
+                    if not (
+                        isinstance(out, dict)
+                        and isinstance(out_aug, dict)
+                        and out.get("pair_features")
+                        and out_aug.get("pair_features")
+                    ):
+                        raise ValueError(
+                            "nuisance_feature_consistency requires model pair_features"
+                        )
+                    clean_anchors = out.get("base_pair_features") or out["pair_features"]
+                    feature_loss = pair_feature_invariance_loss(
+                        clean_anchors, out_aug["pair_features"]
+                    )
+                    loss = loss + nuisance_feature_consistency * feature_loss / grad_accum
+                if nuisance_clean_feature_preservation > 0:
+                    if not (
+                        isinstance(out, dict)
+                        and out.get("base_pair_features")
+                        and out.get("pair_features")
+                    ):
+                        raise ValueError(
+                            "nuisance_clean_feature_preservation requires base_pair_features"
+                        )
+                    preservation_loss = pair_feature_preservation_loss(
+                        out["base_pair_features"], out["pair_features"]
+                    )
+                    loss = loss + (
+                        nuisance_clean_feature_preservation
+                        * preservation_loss
+                        / grad_accum
+                    )
+
+            do_identity_neg = (
+                identity_neg_weight > 0
+                and identity_neg_prob > 0
+                and torch.rand(1, device=img_a.device).item() < identity_neg_prob
+            )
+            if do_identity_neg:
+                # Same-scene appearance perturbations are hard no-change examples.
+                base = img_a if torch.rand(1, device=img_a.device).item() < 0.5 else img_b
+                base_cf = style_perturb(
+                    base,
+                    sigma=style_aug_sigma,
+                    blur_prob=style_blur_prob,
+                )
+                out_neg = model(base, base_cf)
+                logits_neg = out_neg["pred"] if isinstance(out_neg, dict) else out_neg
+                neg_loss = F.binary_cross_entropy_with_logits(
+                    logits_neg, torch.zeros_like(logits_neg)
+                )
+                if isinstance(out_neg, dict) and out_neg.get("logits_all") is not None:
+                    logits_all_neg = out_neg["logits_all"]
+                    if logits_all_neg.ndim == 5:
+                        aux_neg = torch.stack(
+                            [
+                                F.binary_cross_entropy_with_logits(
+                                    logits_all_neg[k], torch.zeros_like(logits_all_neg[k])
+                                )
+                                for k in range(logits_all_neg.shape[0])
+                            ]
+                        ).mean()
+                        neg_loss = neg_loss + head_aux_weight * aux_neg
+                loss = loss + identity_neg_weight * neg_loss / grad_accum
+
+            do_registration_neg = (
+                registration_neg_weight > 0
+                and registration_neg_prob > 0
+                and torch.rand((), device=img_a.device).item() < registration_neg_prob
+            )
+            if do_registration_neg:
+                base = img_a if torch.rand((), device=img_a.device).item() < 0.5 else img_b
+                shifted = registration_perturb(base, max_shift=registration_max_shift)
+                out_registration = model(base, shifted)
+                logits_registration = (
+                    out_registration["pred"]
+                    if isinstance(out_registration, dict)
+                    else out_registration
+                )
+                registration_loss = F.binary_cross_entropy_with_logits(
+                    logits_registration, torch.zeros_like(logits_registration)
+                )
+                loss = loss + registration_neg_weight * registration_loss / grad_accum
+
+            do_nuisance_synth = (
+                nuisance_synth_weight > 0
+                and nuisance_synth_prob > 0
+                and isinstance(out, dict)
+                and out.get("nuisance_logit") is not None
+                and torch.rand((), device=img_a.device).item() < nuisance_synth_prob
+            )
+            if do_nuisance_synth:
+                base = img_a if torch.rand((), device=img_a.device).item() < 0.5 else img_b
+                base_cf = nuisance_perturb(
+                    base,
+                    illumination_strength=nuisance_illumination,
+                    max_shift=nuisance_max_shift,
+                    blur_prob=style_blur_prob,
+                )
+                out_nuisance = model(base, base_cf)
+                nuisance_logit = out_nuisance["nuisance_logit"]
+                gate_loss = F.binary_cross_entropy_with_logits(
+                    nuisance_logit, torch.ones_like(nuisance_logit)
+                )
+                suppress_loss = F.binary_cross_entropy_with_logits(
+                    out_nuisance["pred"], torch.zeros_like(out_nuisance["pred"])
+                )
+                loss = loss + nuisance_synth_weight * (gate_loss + suppress_loss) / grad_accum
         scaler.scale(loss).backward()
         if it % grad_accum == 0:
             scaler.step(optimizer)
             scaler.update()
+            with torch.no_grad():
+                for module in model.modules():
+                    strength = getattr(module, "align_strength", None)
+                    if isinstance(strength, nn.Parameter):
+                        strength.clamp_(0.0, 1.0)
             optimizer.zero_grad(set_to_none=True)
         if it % log_every == 0:
             dt = time.time() - t0
@@ -1162,8 +1691,13 @@ def save_vis_samples(
 
 
 def build_dataloaders(
-    cfg: HeadCfg, require_train: bool = True, require_val: bool = True
+    cfg: HeadCfg,
+    require_train: bool = True,
+    require_val: bool = True,
+    load_val: bool = True,
 ) -> Tuple[Optional[DataLoader], Optional[DataLoader], DataLoader]:
+    if require_val and not load_val:
+        raise ValueError("require_val=True is incompatible with load_val=False")
     root = Path(cfg.data_root)
     train_tf = get_train_transforms(crop_size=cfg.crop_size)
     eval_tf = get_test_transforms_full() if cfg.full_eval else get_val_transforms(crop_size=cfg.eval_crop)
@@ -1195,13 +1729,14 @@ def build_dataloaders(
         )
     eval_batch_size = 1 if cfg.full_eval else cfg.batch_size
     val_ds = None
-    if require_val:
-        val_ds = _make_dataset("val", eval_tf)
-    else:
-        try:
+    if load_val:
+        if require_val:
             val_ds = _make_dataset("val", eval_tf)
-        except FileNotFoundError:
-            val_ds = None
+        else:
+            try:
+                val_ds = _make_dataset("val", eval_tf)
+            except FileNotFoundError:
+                val_ds = None
 
     val_loader = None
     if val_ds is not None:

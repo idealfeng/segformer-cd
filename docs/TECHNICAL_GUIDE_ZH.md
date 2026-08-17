@@ -159,6 +159,10 @@ python train_dino_head.py ^
 
 > `train_dino_head.py` 支持 `--config <json>`：把某个 `config.json` 当默认值加载，再用命令行覆盖差异参数（便于复现/续训）。
 
+需要偏向高 Precision 时，可用源域 validation 的 `F-beta` 选择 checkpoint，例如
+`--selection_metric fbeta --selection_beta 0.5`。`beta < 1` 会提高 Precision 的权重；
+该选择仍必须只使用源域 validation。
+
 ---
 
 ## 6. 评估流程（域内 / 跨域）
@@ -178,12 +182,17 @@ python train_dino_head.py ^
 python eval_dino_head.py ^
   --checkpoint outputs/levir_train/best.pt ^
   --data_root data/WHUCD ^
+  --calib_root data/LEVIR-CD --strict_zeroshot ^
   --device cuda --batch_size 1 --num_workers 0 ^
   --full_eval --eval_crop 256 ^
   --thr_mode fixed --thr 0.5 ^
   --smooth_k 3 --use_minarea --min_area 256 ^
   --use_ensemble_pred --ensemble_strategy mean_logit --ensemble_indices 3,4
 ```
+
+`--strict_zeroshot` 要求 `--calib_root` 与目标 `--data_root` 不同，并且不会构造目标域
+validation loader；同时会拒绝包含目标 GT 的 `--vis`。评估结果中的 `protocol` 字段会记录
+`strict_zeroshot`、`calib_root`、`target_val_loaded` 和最终 ensemble 配置，便于审计。
 
 ### 6.2 非严格协议（仅用于调试/上限参考，不建议写成 strict zero-shot）
 
